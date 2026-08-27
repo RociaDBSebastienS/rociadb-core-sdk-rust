@@ -1,9 +1,9 @@
+use crate::error::{JsonResultExt, StatusResultExt};
 use crate::pb::upstream::v1::{
     AddEdgeRequest, DeleteEdgeRequest, GetNodeRequest, ListGraphsRequest, ListNodesRequest,
     Neighbor, NeighborsInRequest, NeighborsOutRequest, PutNodeRequest,
 };
-use crate::{CONCURRENT_REQUESTS, Page, RociaDbClient, non_empty, page_request};
-use anyhow::{Context, Result};
+use crate::{CONCURRENT_REQUESTS, Page, Result, RociaDbClient, non_empty, page_request};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
@@ -65,27 +65,27 @@ fn next_pagination_cursor(
 impl RociaDbClient {
     /// Fetch one node and decode its JSON payload into the requested type.
     pub async fn get_node_as<T: DeserializeOwned>(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         node_id: &str,
     ) -> Result<T> {
-        let response = self
-            .upstream_graph
+        let mut upstream_graph = self.upstream_graph.clone();
+        let response = upstream_graph
             .get_node(GetNodeRequest {
                 tenant_id: tenant_id.to_string(),
                 graph: graph.to_string(),
                 node_id: node_id.to_string(),
             })
             .await
-            .context("failed to get node")?
+            .status_context("failed to get node")?
             .into_inner();
-        serde_json::from_slice(&response.json).context("failed to decode node json")
+        serde_json::from_slice(&response.json).decode_context("node json")
     }
 
     /// Create or replace one node using its complete node id (for example `product:42`).
     pub async fn put_node<T: Serialize + ?Sized>(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         node_id: &str,
@@ -103,15 +103,16 @@ impl RociaDbClient {
 
     /// Create or replace one node with a caller-provided idempotency key.
     pub async fn put_node_with_request_id<T: Serialize + ?Sized>(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         node_id: &str,
         value: &T,
         request_id: impl Into<String>,
     ) -> Result<()> {
-        let json = serde_json::to_vec(value).context("failed to encode node json")?;
-        self.upstream_graph
+        let json = serde_json::to_vec(value).encode_context("node json")?;
+        let mut upstream_graph = self.upstream_graph.clone();
+        upstream_graph
             .put_node(PutNodeRequest {
                 tenant_id: tenant_id.to_string(),
                 graph: graph.to_string(),
@@ -120,7 +121,7 @@ impl RociaDbClient {
                 request_id: request_id.into(),
             })
             .await
-            .context("failed to put node")?;
+            .status_context("failed to put node")?;
         Ok(())
     }
 
@@ -131,7 +132,7 @@ impl RociaDbClient {
     /// adding an edge between them.
     #[allow(clippy::too_many_arguments)]
     pub async fn add_edge<T: Serialize + ?Sized>(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         edge_id: &str,
@@ -160,7 +161,7 @@ impl RociaDbClient {
     /// adding an edge between them.
     #[allow(clippy::too_many_arguments)]
     pub async fn add_edge_with_request_id<T: Serialize + ?Sized>(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         edge_id: &str,
@@ -170,8 +171,9 @@ impl RociaDbClient {
         value: &T,
         request_id: impl Into<String>,
     ) -> Result<()> {
-        let json = serde_json::to_vec(value).context("failed to encode edge json")?;
-        self.upstream_graph
+        let json = serde_json::to_vec(value).encode_context("edge json")?;
+        let mut upstream_graph = self.upstream_graph.clone();
+        upstream_graph
             .add_edge(AddEdgeRequest {
                 tenant_id: tenant_id.to_string(),
                 graph: graph.to_string(),
@@ -183,19 +185,20 @@ impl RociaDbClient {
                 request_id: request_id.into(),
             })
             .await
-            .context("failed to add edge")?;
+            .status_context("failed to add edge")?;
         Ok(())
     }
 
     /// Delete one edge with a caller-provided idempotency key.
     pub async fn delete_edge_with_request_id(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         edge_id: &str,
         request_id: impl Into<String>,
     ) -> Result<()> {
-        self.upstream_graph
+        let mut upstream_graph = self.upstream_graph.clone();
+        upstream_graph
             .delete_edge(DeleteEdgeRequest {
                 tenant_id: tenant_id.to_string(),
                 graph: graph.to_string(),
@@ -203,13 +206,13 @@ impl RociaDbClient {
                 request_id: request_id.into(),
             })
             .await
-            .context("failed to delete edge")?;
+            .status_context("failed to delete edge")?;
         Ok(())
     }
 
     /// Return one paginated page of outgoing neighbors.
     pub async fn neighbors_out(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         from: &str,
@@ -217,8 +220,8 @@ impl RociaDbClient {
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<NeighborPage> {
-        let response = self
-            .upstream_graph
+        let mut upstream_graph = self.upstream_graph.clone();
+        let response = upstream_graph
             .neighbors_out(NeighborsOutRequest {
                 tenant_id: tenant_id.to_string(),
                 graph: graph.to_string(),
@@ -227,7 +230,7 @@ impl RociaDbClient {
                 page: page_request(limit, cursor)?,
             })
             .await
-            .context("failed to get outgoing neighbors")?
+            .status_context("failed to get outgoing neighbors")?
             .into_inner();
         Ok(NeighborPage {
             neighbors: response.neighbors,
@@ -237,7 +240,7 @@ impl RociaDbClient {
 
     /// Return one paginated page of incoming neighbors.
     pub async fn neighbors_in(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         to: &str,
@@ -245,8 +248,8 @@ impl RociaDbClient {
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<NeighborPage> {
-        let response = self
-            .upstream_graph
+        let mut upstream_graph = self.upstream_graph.clone();
+        let response = upstream_graph
             .neighbors_in(NeighborsInRequest {
                 tenant_id: tenant_id.to_string(),
                 graph: graph.to_string(),
@@ -255,7 +258,7 @@ impl RociaDbClient {
                 page: page_request(limit, cursor)?,
             })
             .await
-            .context("failed to get incoming neighbors")?
+            .status_context("failed to get incoming neighbors")?
             .into_inner();
         Ok(NeighborPage {
             neighbors: response.neighbors,
@@ -265,19 +268,19 @@ impl RociaDbClient {
 
     /// Return one paginated page of graph names holding at least one node.
     pub async fn list_graphs(
-        &mut self,
+        &self,
         tenant_id: &str,
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<Page<String>> {
-        let response = self
-            .upstream_graph
+        let mut upstream_graph = self.upstream_graph.clone();
+        let response = upstream_graph
             .list_graphs(ListGraphsRequest {
                 tenant_id: tenant_id.to_string(),
                 page: page_request(limit, cursor)?,
             })
             .await
-            .context("failed to list graphs")?
+            .status_context("failed to list graphs")?
             .into_inner();
         Ok(Page {
             items: response.graphs,
@@ -287,21 +290,21 @@ impl RociaDbClient {
 
     /// Return one paginated page of node ids stored in one graph.
     pub async fn list_nodes(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<Page<String>> {
-        let response = self
-            .upstream_graph
+        let mut upstream_graph = self.upstream_graph.clone();
+        let response = upstream_graph
             .list_nodes(ListNodesRequest {
                 tenant_id: tenant_id.to_string(),
                 graph: graph.to_string(),
                 page: page_request(limit, cursor)?,
             })
             .await
-            .context("failed to list nodes")?
+            .status_context("failed to list nodes")?
             .into_inner();
         Ok(Page {
             items: response.node_ids,
@@ -311,7 +314,7 @@ impl RociaDbClient {
 
     /// Load all outgoing neighbors and decode each node payload.
     pub async fn get_outgoing_neighbor_nodes<T: DeserializeOwned>(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         node_id: &str,
@@ -329,7 +332,7 @@ impl RociaDbClient {
 
     /// Load all incoming neighbors and decode each node payload.
     pub async fn get_incoming_neighbor_nodes<T: DeserializeOwned>(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         node_id: &str,
@@ -359,7 +362,7 @@ impl RociaDbClient {
     // index survivant a un node supprime) avec encore des donnees a venir
     // ensuite.
     async fn get_neighbor_nodes<T: DeserializeOwned>(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph: &str,
         node_id: &str,
@@ -415,10 +418,10 @@ impl RociaDbClient {
                             node_id: neighbor.node_id.clone(),
                         })
                         .await
-                        .context("failed to get neighbor node")?
+                        .status_context("failed to get neighbor node")?
                         .into_inner();
                     let value = serde_json::from_slice(&response.json)
-                        .context("failed to decode neighbor node json")?;
+                        .decode_context("neighbor node json")?;
                     Ok(NeighborNode {
                         edge_id: neighbor.edge_id,
                         node_id: neighbor.node_id,
@@ -435,7 +438,7 @@ impl RociaDbClient {
 #[cfg(test)]
 mod tests {
     use super::next_pagination_cursor;
-    use crate::{non_empty, page_request};
+    use crate::{RociaDbError, non_empty, page_request};
 
     #[test]
     fn pagination_uses_defaults_and_hides_empty_cursor() {
@@ -451,6 +454,14 @@ mod tests {
     #[test]
     fn zero_limit_is_rejected() {
         let error = page_request(Some(0), None).expect_err("limit 0 should be rejected");
+        // EN: A null page limit is a client-side rule, so it must surface
+        // as `RociaDbError::Validation`, not a generic/catch-all variant,
+        // and the message must say why.
+        // FR: Une limite de page nulle est une regle cote client, elle
+        // doit donc apparaitre en `RociaDbError::Validation`, pas en
+        // variante generique/fourre-tout, et le message doit dire
+        // pourquoi.
+        assert!(matches!(error, RociaDbError::Validation(_)));
         assert!(error.to_string().contains("greater than zero"));
     }
 

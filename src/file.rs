@@ -26,12 +26,12 @@
 //! [`RociaDbClient::upload_file`] respecte toujours ce contrat. N utilisez
 //! [`RociaDbClient::upload_file_stream`] directement que si vous
 //! comprenez ce contrat et le reproduisez vous-meme.
+use crate::error::StatusResultExt;
 use crate::pb::upstream::v1::{
     DeleteRequest, DownloadRequest, DownloadResponse, ListBucketsRequest, ListFilesRequest,
     StatRequest, StatResponse, UploadRequest,
 };
-use crate::{Page, RociaDbClient, non_empty, page_request};
-use anyhow::{Context, Result, ensure};
+use crate::{Page, Result, RociaDbClient, RociaDbError, non_empty, page_request};
 use futures::{Stream, stream};
 use sha2::{Digest, Sha256};
 use tonic::codec::Streaming;
@@ -145,14 +145,15 @@ impl RociaDbClient {
     /// Pour le cas courant — uploader un buffer d octets en memoire —
     /// utilisez plutot [`RociaDbClient::upload_file`], qui construit un
     /// flux correct pour vous.
-    pub async fn upload_file_stream<S>(&mut self, requests: S) -> Result<()>
+    pub async fn upload_file_stream<S>(&self, requests: S) -> Result<()>
     where
         S: Stream<Item = UploadRequest> + Send + 'static,
     {
-        self.upstream_file
+        let mut upstream_file = self.upstream_file.clone();
+        upstream_file
             .upload(requests)
             .await
-            .context("failed to upload file")?;
+            .status_context("failed to upload file")?;
         Ok(())
     }
 
@@ -185,7 +186,7 @@ impl RociaDbClient {
     /// rejetes cote client avec une erreur claire plutot que de faire
     /// echouer l upload en cours de route.
     pub async fn upload_file(
-        &mut self,
+        &self,
         tenant_id: &str,
         bucket: &str,
         file_id: &str,
@@ -193,12 +194,14 @@ impl RociaDbClient {
         options: FileUploadOptions,
     ) -> Result<()> {
         let bytes = bytes.as_ref();
-        let size_bytes = u64::try_from(bytes.len()).context("file is too large")?;
-        ensure!(
-            size_bytes <= MAX_FILE_BYTES,
-            "file is {size_bytes} bytes, which exceeds the server's {MAX_FILE_BYTES}-byte \
-             (5 GiB) limit"
-        );
+        let size_bytes = u64::try_from(bytes.len())
+            .map_err(|_| RociaDbError::validation("file is too large"))?;
+        if size_bytes > MAX_FILE_BYTES {
+            return Err(RociaDbError::validation(format!(
+                "file is {size_bytes} bytes, which exceeds the server's {MAX_FILE_BYTES}-byte \
+                 (5 GiB) limit"
+            )));
+        }
 
         let checksum = resolve_checksum(options.checksum, bytes)?;
         let request_id = options
@@ -219,26 +222,26 @@ impl RociaDbClient {
 
     /// Start a server-streaming download without buffering the complete file.
     pub async fn download_file_stream(
-        &mut self,
+        &self,
         tenant_id: &str,
         bucket: &str,
         file_id: &str,
     ) -> Result<Streaming<DownloadResponse>> {
-        Ok(self
-            .upstream_file
+        let mut upstream_file = self.upstream_file.clone();
+        Ok(upstream_file
             .download(DownloadRequest {
                 tenant_id: tenant_id.to_string(),
                 bucket: bucket.to_string(),
                 file_id: file_id.to_string(),
             })
             .await
-            .context("failed to start file download")?
+            .status_context("failed to start file download")?
             .into_inner())
     }
 
     /// Download a complete file into memory.
     pub async fn download_file(
-        &mut self,
+        &self,
         tenant_id: &str,
         bucket: &str,
         file_id: &str,
@@ -250,7 +253,7 @@ impl RociaDbClient {
         while let Some(response) = stream
             .message()
             .await
-            .context("file download stream failed")?
+            .status_context("file download stream failed")?
         {
             bytes.extend_from_slice(&response.chunk);
         }
@@ -259,38 +262,38 @@ impl RociaDbClient {
 
     /// Return metadata for one stored file.
     pub async fn stat_file(
-        &mut self,
+        &self,
         tenant_id: &str,
         bucket: &str,
         file_id: &str,
     ) -> Result<StatResponse> {
-        Ok(self
-            .upstream_file
+        let mut upstream_file = self.upstream_file.clone();
+        Ok(upstream_file
             .stat(StatRequest {
                 tenant_id: tenant_id.to_string(),
                 bucket: bucket.to_string(),
                 file_id: file_id.to_string(),
             })
             .await
-            .context("failed to stat file")?
+            .status_context("failed to stat file")?
             .into_inner())
     }
 
     /// Return one paginated page of bucket names holding at least one file.
     pub async fn list_buckets(
-        &mut self,
+        &self,
         tenant_id: &str,
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<Page<String>> {
-        let response = self
-            .upstream_file
+        let mut upstream_file = self.upstream_file.clone();
+        let response = upstream_file
             .list_buckets(ListBucketsRequest {
                 tenant_id: tenant_id.to_string(),
                 page: page_request(limit, cursor)?,
             })
             .await
-            .context("failed to list buckets")?
+            .status_context("failed to list buckets")?
             .into_inner();
         Ok(Page {
             items: response.buckets,
@@ -300,21 +303,21 @@ impl RociaDbClient {
 
     /// Return one paginated page of file ids stored in one bucket.
     pub async fn list_files(
-        &mut self,
+        &self,
         tenant_id: &str,
         bucket: &str,
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<Page<String>> {
-        let response = self
-            .upstream_file
+        let mut upstream_file = self.upstream_file.clone();
+        let response = upstream_file
             .list_files(ListFilesRequest {
                 tenant_id: tenant_id.to_string(),
                 bucket: bucket.to_string(),
                 page: page_request(limit, cursor)?,
             })
             .await
-            .context("failed to list files")?
+            .status_context("failed to list files")?
             .into_inner();
         Ok(Page {
             items: response.file_ids,
@@ -323,12 +326,7 @@ impl RociaDbClient {
     }
 
     /// Delete one stored file using an automatically generated idempotency key.
-    pub async fn delete_file(
-        &mut self,
-        tenant_id: &str,
-        bucket: &str,
-        file_id: &str,
-    ) -> Result<()> {
+    pub async fn delete_file(&self, tenant_id: &str, bucket: &str, file_id: &str) -> Result<()> {
         self.delete_file_with_request_id(
             tenant_id,
             bucket,
@@ -340,13 +338,14 @@ impl RociaDbClient {
 
     /// Delete one stored file with a caller-provided idempotency key.
     pub async fn delete_file_with_request_id(
-        &mut self,
+        &self,
         tenant_id: &str,
         bucket: &str,
         file_id: &str,
         request_id: impl Into<String>,
     ) -> Result<()> {
-        self.upstream_file
+        let mut upstream_file = self.upstream_file.clone();
+        upstream_file
             .delete(DeleteRequest {
                 tenant_id: tenant_id.to_string(),
                 bucket: bucket.to_string(),
@@ -354,7 +353,7 @@ impl RociaDbClient {
                 request_id: request_id.into(),
             })
             .await
-            .context("failed to delete file")?;
+            .status_context("failed to delete file")?;
         Ok(())
     }
 }
@@ -375,11 +374,12 @@ impl RociaDbClient {
 fn resolve_checksum(checksum: Option<Vec<u8>>, bytes: &[u8]) -> Result<Vec<u8>> {
     match checksum {
         Some(checksum) => {
-            ensure!(
-                checksum.len() == CHECKSUM_LEN,
-                "checksum must be exactly {CHECKSUM_LEN} bytes (sha256), got {} bytes",
-                checksum.len()
-            );
+            if checksum.len() != CHECKSUM_LEN {
+                return Err(RociaDbError::validation(format!(
+                    "checksum must be exactly {CHECKSUM_LEN} bytes (sha256), got {} bytes",
+                    checksum.len()
+                )));
+            }
             Ok(checksum)
         }
         None => Ok(Sha256::digest(bytes).to_vec()),
@@ -455,6 +455,7 @@ mod tests {
         CHECKSUM_LEN, DEFAULT_CHUNK_SIZE, FileUploadOptions, chunk_upload_requests,
         resolve_checksum,
     };
+    use crate::RociaDbError;
 
     #[test]
     fn upload_options_have_safe_defaults() {
@@ -641,7 +642,19 @@ mod tests {
     fn resolve_checksum_rejects_wrong_length_before_any_network_call() {
         let error = resolve_checksum(Some(vec![1u8; 10]), b"irrelevant")
             .expect_err("a 10-byte checksum must be rejected");
-        assert!(error.to_string().contains("32 bytes"));
+        // EN: A checksum of the wrong length is a client-side rule, so it
+        // must surface as `RociaDbError::Validation`, not a catch-all
+        // variant, with a message precise enough to act on.
+        // FR: Un checksum de mauvaise longueur est une regle cote client,
+        // il doit donc apparaitre en `RociaDbError::Validation`, pas en
+        // variante fourre-tout, avec un message assez precis pour agir.
+        assert!(matches!(error, RociaDbError::Validation(_)));
+        let message = error.to_string();
+        assert!(message.contains("32 bytes"));
+        assert!(
+            message.contains("got 10 bytes"),
+            "message should report the actual (wrong) length, got: {message}"
+        );
     }
 
     fn decode_hex(hex: &str) -> Vec<u8> {

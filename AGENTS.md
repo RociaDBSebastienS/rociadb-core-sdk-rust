@@ -23,7 +23,7 @@ Run formatting, Clippy, and tests before submitting changes.
 
 ## Coding Style & Naming Conventions
 
-Use rustfmt defaults and idiomatic Rust naming. Prefer contextual errors and avoid panics or unchecked casts in public paths. Preserve existing English/French (`EN:`/`FR:`) Rust documentation. Do not edit generated output. Protobuf changes must originate in canonical `proto/` here and be mirrored byte-for-byte into the sibling [`rociadb-core-sdk-ts`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-ts) repository's own copy — that repository uses TypeScript strict mode, two-space indentation, `camelCase` values, and `PascalCase` types, but none of its files live in this checkout.
+Use rustfmt defaults and idiomatic Rust naming. Public methods return `rocia_db_sdk::Result<T>` (an alias for `std::result::Result<T, RociaDbError>`, defined in `src/error.rs`) rather than `anyhow::Result` — extend the existing `RociaDbError` variants (or add a new one) for a new fallible case instead of reaching for `anyhow`, and avoid panics or unchecked casts in public paths. Preserve existing English/French (`EN:`/`FR:`) Rust documentation. Do not edit generated output. Protobuf changes must originate in canonical `proto/` here and be mirrored byte-for-byte into the sibling [`rociadb-core-sdk-ts`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-ts) repository's own copy — that repository uses TypeScript strict mode, two-space indentation, `camelCase` values, and `PascalCase` types, but none of its files live in this checkout.
 
 ## Testing Guidelines
 

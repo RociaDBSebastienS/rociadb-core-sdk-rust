@@ -41,8 +41,8 @@ use rocia_db_sdk::RociaDbBuilder;
 use serde_json::json;
 
 # #[tokio::main]
-# async fn main() -> anyhow::Result<()> {
-let mut client = RociaDbBuilder::new()
+# async fn main() -> rocia_db_sdk::Result<()> {
+let client = RociaDbBuilder::new()
     .host("http://127.0.0.1:50051")
     .auth_client_credentials(
         "https://example.com/token",
@@ -130,22 +130,27 @@ confondre gaspille des retries :
 ```rust
 match client.get_document::<serde_json::Value>("tenant-1", "products", "sku-123").await {
     Ok(doc) => { /* ... */ }
-    Err(err) => {
-        if let Some(status) = err.downcast_ref::<tonic::Status>() {
-            match status.code() {
-                tonic::Code::Unauthenticated => {
-                    client.refresh_auth_token().await?;
-                    // retry
-                }
-                tonic::Code::PermissionDenied => {
-                    // do not retry: wrong scope or wrong client_id
-                }
-                _ => {}
-            }
-        }
+    Err(err) if err.is_unauthenticated() => {
+        client.refresh_auth_token().await?;
+        // retry
     }
+    Err(err) if err.is_permission_denied() => {
+        // do not retry: wrong scope or wrong client_id
+    }
+    Err(err) => return Err(err),
 }
 ```
+
+EN: `is_unauthenticated()` and `is_permission_denied()` are shorthands on
+`RociaDbError` for the two gRPC codes that matter most here — see
+[API Conventions](#api-conventions) for the full typed-error surface,
+including `.code()`, `.reason()`, and `.status()` for anything more
+specific than these two predicates.
+FR: `is_unauthenticated()` et `is_permission_denied()` sont des raccourcis
+sur `RociaDbError` pour les deux codes gRPC qui comptent ici — voir
+[API Conventions](#api-conventions) pour la surface complete de l erreur
+typee, dont `.code()`, `.reason()`, et `.status()` pour tout ce qui va
+au-dela de ces deux predicats.
 
 EN: Every gRPC status also carries a `reason` metadata value (`invalid_argument`,
 `not_found`, `already_exists`, `permission_denied`, `unauthenticated`,
@@ -169,7 +174,7 @@ EN: For local/testing environments you can disable auth explicitly:
 FR: Pour un environnement local/test tu peux desactiver l auth explicitement:
 
 ```rust
-let mut client = RociaDbBuilder::new()
+let client = RociaDbBuilder::new()
     .host("http://127.0.0.1:50051")
     .disable_auth()
     .build()
@@ -594,24 +599,117 @@ dedupliquent entre eux. Les marqueurs d idempotence expirent apres
 `gc.request_ttl_secs` cote serveur, **24 heures par defaut** — un rejeu
 au-dela de cette fenetre est reexecute.
 
-EN: Public methods return `anyhow::Result` with operation-specific context. The error
-chain preserves `tonic::Status` for gRPC failures and `serde_json::Error` for JSON
-encoding or decoding failures. Callers can inspect these causes with
-`error.downcast_ref::<tonic::Status>()` when status-aware handling is required.
-FR: Les methodes publiques retournent `anyhow::Result` avec un contexte
-specifique a l operation. La chaine d erreur preserve `tonic::Status` pour
-les echecs gRPC et `serde_json::Error` pour les echecs d encodage/decodage
-JSON. Les appelants peuvent inspecter ces causes avec
-`error.downcast_ref::<tonic::Status>()` quand un traitement sensible au
-statut est necessaire.
+EN: Public methods return `rocia_db_sdk::Result<T>`, an alias for
+`std::result::Result<T, RociaDbError>`. `RociaDbError` is a typed enum,
+not a boxed `dyn Error`, so callers can `match` on the failure kind
+directly instead of downcasting:
+FR: Les methodes publiques retournent `rocia_db_sdk::Result<T>`, un alias
+pour `std::result::Result<T, RociaDbError>`. `RociaDbError` est une enum
+typee, pas un `dyn Error` boxe, donc les appelants peuvent faire un `match`
+direct sur le type d echec plutot que de downcaster :
 
-EN: The former `node_upsert`, `edges_upsert`, and `get_neighbors_nodes` methods remain
-available as deprecated compatibility aliases. New code should use `put_nodes`,
-`add_edges`, and the typed neighbor methods.
-FR: Les anciennes methodes `node_upsert`, `edges_upsert` et
-`get_neighbors_nodes` restent disponibles comme alias de compatibilite
-depreciees. Le nouveau code doit utiliser `put_nodes`, `add_edges`, et les
-methodes de voisinage typees.
+- `Status { operation, status }` — a gRPC call to the upstream server
+  returned a non-OK status; carries the raw `tonic::Status`, so nothing is
+  lost compared to calling the generated client directly. `.code()`
+  returns the `tonic::Code`; `.reason()` returns the server's `reason`
+  trailing-metadata value (`invalid_argument`, `not_found`,
+  `already_exists`, `permission_denied`, `unauthenticated`, `internal`) —
+  finer-grained than the code alone; `.status()` returns the raw
+  `tonic::Status` for anything not covered by the two accessors above.
+  `.is_unauthenticated()` and `.is_permission_denied()` are shorthands for
+  the two codes that matter most for retry logic (see
+  [`UNAUTHENTICATED` vs `PERMISSION_DENIED`](#unauthenticated-vs-permission_denied)).
+- `Connection { .. }` — failed to connect to, or configure, the upstream
+  endpoint (invalid host, TLS setup, connection refused, missing builder
+  configuration).
+- `Auth { .. }` — failed to obtain or refresh the upstream auth token.
+- `Encode { context, .. }` / `Decode { context, .. }` — failed to encode a
+  value as JSON before sending it upstream, or failed to decode a JSON
+  payload received from upstream; wraps the underlying `serde_json::Error`.
+- `Validation(String)` — a client-side rule was violated before any
+  network call (a zero page limit, a checksum of the wrong length, an
+  incomplete `node_label`/`node_graph` pair, a file size out of bounds,
+  etc).
+
+EN: Every variant implements `std::error::Error`, so `RociaDbError` composes
+normally with `?` inside a function returning `anyhow::Result<...>` (or any
+other error type with a blanket `From<E: std::error::Error>`), the same way
+`anyhow::Error` did before. Only code that specifically downcast to
+`tonic::Status` needs to change — see [Migrating to 0.4.0](#migrating-to-040).
+FR: Chaque variante implemente `std::error::Error`, donc `RociaDbError` se
+compose normalement avec `?` dans une fonction qui retourne un
+`anyhow::Result<...>` (ou tout autre type d erreur avec un `From<E:
+std::error::Error>` generique), de la meme facon que `anyhow::Error`
+avant. Seul le code qui downcastait specifiquement vers `tonic::Status`
+doit changer — voir [Migrating to 0.4.0](#migrating-to-040).
+
+EN: The generated protobuf/gRPC types live in the `pb` module, but that
+module is **not** part of the SDK's semver contract — a routine prost or
+tonic upgrade can reshape it without the SDK's own API changing at all.
+The handful of generated types that do appear in a public method signature
+are re-exported individually at the crate root instead: `CollectionInfo`,
+`StatResponse`, `Neighbor`, `UploadRequest`, `DownloadResponse`. Depend on
+those re-exports, not on paths reaching into `pb` directly.
+FR: Les types protobuf/gRPC generes vivent dans le module `pb`, mais ce
+module ne fait **pas** partie du contrat semver du SDK — une montee de
+version courante de prost ou tonic peut le remanier sans que l API du SDK
+elle-meme ne change. La poignee de types generes qui apparaissent bien
+dans une signature de methode publique sont reexportes individuellement a
+la racine du crate a la place : `CollectionInfo`, `StatResponse`,
+`Neighbor`, `UploadRequest`, `DownloadResponse`. Dependez de ces
+reexports, pas de chemins qui plongent directement dans `pb`.
+
+## Migrating to 0.4.0
+
+EN: 0.4.0 reshapes the public API surface itself — error type, method
+receiver, and the removal of deprecated aliases — with **no change to any
+observable server behavior**: the wire contract and every validation rule
+are exactly as in 0.3.0. Three changes to audit call sites for:
+FR: La 0.4.0 remanie la surface de l API publique elle-meme — type d
+erreur, receveur des methodes, retrait des alias depreciees — **sans
+aucun changement de comportement observable cote serveur** : le contrat
+reseau et chaque regle de validation sont exactement ceux de la 0.3.0.
+Trois changements a auditer dans vos points d appel :
+
+1. **Public methods now return `rocia_db_sdk::Result<T>` (an alias for
+   `std::result::Result<T, RociaDbError>`) instead of `anyhow::Result<T>`.**
+   `RociaDbError` is a typed enum — see [API Conventions](#api-conventions)
+   above for its variants and accessors. **Migration:** this is the one
+   change that genuinely needs code edits, and only if you inspected
+   errors with `error.downcast_ref::<tonic::Status>()`; replace that with
+   `error.status()`, `error.code()`, `error.reason()`, or the
+   `is_unauthenticated()`/`is_permission_denied()` shorthands — see the
+   rewritten example in
+   [`UNAUTHENTICATED` vs `PERMISSION_DENIED`](#unauthenticated-vs-permission_denied).
+   If instead your code only ever propagated SDK errors upward with `?`
+   (for example inside a function returning `anyhow::Result<...>`),
+   nothing needs to change: `RociaDbError` implements `std::error::Error`,
+   so it converts the same way `anyhow::Error`'s sources always did.
+2. **Every `RociaDbClient` method now takes `&self` instead of `&mut
+   self`.** **Migration:** in practice this does not break existing call
+   sites — Rust resolves a `&self` method the same way through a `&mut`
+   binding or a plain value. The only symptom you may see is an
+   `unused_mut` warning on a `let mut client = ...` that is no longer
+   needed; drop the `mut`, or ignore the warning if your lints do not
+   treat it as an error. This is also what makes a `RociaDbClient` shared
+   behind an `Arc` safe to use concurrently without a `Mutex`: every
+   method clones the cheap, `Arc`-backed inner service client before
+   issuing its RPC, the same way the batch helpers (`put_nodes`,
+   `add_edges`) always have.
+3. **The `node_upsert`, `edges_upsert`, and `get_neighbors_nodes`
+   compatibility aliases (deprecated since 0.2.0) have been removed.**
+   **Migration:** replace `node_upsert` with `put_nodes`, `edges_upsert`
+   with `add_edges`, and `get_neighbors_nodes` with
+   `get_outgoing_neighbor_nodes` (or `get_incoming_neighbor_nodes`) for
+   typed payloads via `get_outgoing_neighbor_nodes::<T>` — see
+   [API Conventions](#api-conventions).
+
+EN: None of the three changes above touch the wire contract: a 0.4.0
+client and a 0.3.0 client observe the exact same server behavior for the
+exact same calls.
+FR: Aucun des trois changements ci-dessus ne touche au contrat reseau : un
+client 0.4.0 et un client 0.3.0 observent exactement le meme comportement
+serveur pour les memes appels.
 
 ## Migrating to 0.3.0
 

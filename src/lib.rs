@@ -8,8 +8,8 @@
 //! use serde_json::json;
 //!
 //! # #[tokio::main]
-//! # async fn main() -> anyhow::Result<()> {
-//! let mut client = RociaDbBuilder::new()
+//! # async fn main() -> rocia_db_sdk::Result<()> {
+//! let client = RociaDbBuilder::new()
 //!     .host("http://127.0.0.1:50051")
 //!     .auth_client_credentials(
 //!         "https://example.com/token",
@@ -36,25 +36,30 @@
 
 pub mod auth;
 mod document;
+mod error;
 pub mod file;
 pub mod graph;
+#[doc(hidden)]
 pub mod pb;
 mod tenant;
 
+pub use error::{Result, RociaDbError};
 pub use file::FileUploadOptions;
 pub use graph::{NeighborNode, NeighborPage};
-pub use pb::upstream::v1::CollectionInfo;
+pub use pb::upstream::v1::{
+    CollectionInfo, DownloadResponse, Neighbor, StatResponse, UploadRequest,
+};
 
+use crate::error::{AuthResultExt, ConnectionResultExt, JsonResultExt, StatusResultExt};
 use crate::pb::upstream::v1::document_service_client::DocumentServiceClient;
 use crate::pb::upstream::v1::file_service_client::FileServiceClient;
 use crate::pb::upstream::v1::graph_service_client::GraphServiceClient;
 use crate::pb::upstream::v1::tenant_service_client::TenantServiceClient;
 use crate::pb::upstream::v1::{
-    AddEdgeRequest, FindByFieldRequest, GetDocRequest, GetNodeRequest, GetNodeResponse,
-    ListCollectionsRequest, ListDocRequest, PageRequest, PutDocRequest, PutNodeRequest,
-    QueryDocRequest, QueryFilter, QueryOperator, QuerySort, SortDirection,
+    AddEdgeRequest, FindByFieldRequest, GetDocRequest, GetNodeRequest, ListCollectionsRequest,
+    ListDocRequest, PageRequest, PutDocRequest, PutNodeRequest, QueryDocRequest, QueryFilter,
+    QueryOperator, QuerySort, SortDirection,
 };
-use anyhow::{Context, Result, bail};
 use auth::{BearerInterceptor, TokenManager, TokenRefreshGuard};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
@@ -100,10 +105,21 @@ pub struct RociaDbBuilder {
 ///
 /// EN: `Clone` is cheap: clones share the same underlying channel, token
 /// manager, and background token-refresh task (the refresh task keeps
-/// running until every clone has been dropped).
+/// running until every clone has been dropped). Every method takes `&self`
+/// (not `&mut self`): each call clones the cheap, `Arc`-backed inner
+/// service client before issuing its RPC, the same way the batch helpers
+/// ([`RociaDbClient::put_nodes`], [`RociaDbClient::add_edges`]) always
+/// have. A shared `RociaDbClient` behind an `Arc` therefore needs no
+/// `Mutex` to be usable concurrently.
 /// FR: `Clone` est peu couteux : les clones partagent le meme channel sous-
 /// jacent, le meme gestionnaire de token, et la meme tache de refresh en
 /// arriere-plan (la tache continue de tourner tant qu il reste un clone).
+/// Chaque methode prend `&self` (pas `&mut self`) : chaque appel clone le
+/// client de service interne, peu couteux car adosse a un `Arc`, avant
+/// d emettre son RPC, comme le font deja les helpers de batch
+/// ([`RociaDbClient::put_nodes`], [`RociaDbClient::add_edges`]). Un
+/// `RociaDbClient` partage derriere un `Arc` n a donc besoin d aucun
+/// `Mutex` pour etre utilisable de facon concurrente.
 #[derive(Clone)]
 pub struct RociaDbClient {
     upstream_document: DocumentServiceClient<InterceptedService<Channel, BearerInterceptor>>,
@@ -159,7 +175,9 @@ pub(crate) fn page_request(
     cursor: Option<&str>,
 ) -> Result<Option<PageRequest>> {
     if limit == Some(0) {
-        bail!("page limit must be greater than zero");
+        return Err(RociaDbError::validation(
+            "page limit must be greater than zero",
+        ));
     }
     Ok(Some(PageRequest {
         limit: limit.unwrap_or(DEFAULT_PAGE_SIZE),
@@ -183,11 +201,10 @@ pub(crate) fn non_empty(value: String) -> Option<String> {
 /// soit testable unitairement sans client reel.
 fn validate_node_binding(node_label: &Option<String>, node_graph: &Option<String>) -> Result<()> {
     if node_label.is_some() != node_graph.is_some() {
-        bail!(
+        return Err(RociaDbError::validation(format!(
             "node_label and node_graph must be provided together (got node_label={:?}, node_graph={:?})",
-            node_label,
-            node_graph
-        );
+            node_label, node_graph
+        )));
     }
     Ok(())
 }
@@ -347,16 +364,19 @@ impl RociaDbBuilder {
     /// FR: Returns:
     /// - `RociaDbClient` connecte.
     pub async fn build(&self) -> Result<RociaDbClient> {
-        let host = self.host.as_ref().context("missing upstream host")?;
+        let host = self
+            .host
+            .as_ref()
+            .ok_or_else(|| RociaDbError::connection("missing upstream host"))?;
         info!(host = %host, "building rocia db client");
         let endpoint = Endpoint::from_shared(host.clone())
-            .context("invalid upstream host")?
+            .connection_context("invalid upstream host")?
             .tls_config(ClientTlsConfig::new().with_native_roots())
-            .context("failed to configure TLS")?;
+            .connection_context("failed to configure TLS")?;
         let channel = endpoint
             .connect()
             .await
-            .context("failed to connect to upstream")?;
+            .connection_context("failed to connect to upstream")?;
         let (interceptor, token_manager, token_refresh_guard) = match &self.auth {
             BuilderAuthConfig::Disabled => {
                 warn!(host = %host, "building rocia db client with auth disabled");
@@ -370,15 +390,23 @@ impl RociaDbBuilder {
                 let token_url = token_url
                     .clone()
                     .or_else(|| env::var(AUTH_TOKEN_URL_ENV).ok())
-                    .context("missing auth token url (set AUTH_TOKEN_URL)")?;
+                    .ok_or_else(|| {
+                        RociaDbError::connection("missing auth token url (set AUTH_TOKEN_URL)")
+                    })?;
                 let client_id = client_id
                     .clone()
                     .or_else(|| env::var(AUTH_CLIENT_ID_ENV).ok())
-                    .context("missing auth client id (set AUTH_CLIENT_ID)")?;
+                    .ok_or_else(|| {
+                        RociaDbError::connection("missing auth client id (set AUTH_CLIENT_ID)")
+                    })?;
                 let client_secret = client_secret
                     .clone()
                     .or_else(|| env::var(AUTH_CLIENT_SECRET_ENV).ok())
-                    .context("missing auth client secret (set AUTH_CLIENT_SECRET)")?;
+                    .ok_or_else(|| {
+                        RociaDbError::connection(
+                            "missing auth client secret (set AUTH_CLIENT_SECRET)",
+                        )
+                    })?;
 
                 debug!(
                     host = %host,
@@ -389,7 +417,7 @@ impl RociaDbBuilder {
                 let token_manager =
                     TokenManager::new(reqwest::Client::new(), token_url, client_id, client_secret)
                         .await
-                        .context("failed to initialize token manager")?;
+                        .auth_context("failed to initialize token manager")?;
                 let interceptor = token_manager.interceptor();
                 // EN: The IdP token used to die silently after its
                 // `expires_in` (600s here) because nothing ever refreshed
@@ -505,7 +533,7 @@ impl RociaDbClient {
     /// l ecriture du node, ou en traitant un document sans son node attendu
     /// comme necessitant une reparation).
     pub async fn create_document(
-        &mut self,
+        &self,
         tenant_id: &str,
         collection_name: &str,
         document_id: &str,
@@ -521,16 +549,17 @@ impl RociaDbClient {
             has_node_binding = node_label.is_some() && node_graph.is_some(),
             "upserting document"
         );
-        let json = serde_json::to_vec(&value).map_err(|error| {
-            error!(
-                tenant_id = tenant_id,
-                collection = collection_name,
-                document_id = document_id,
-                error = %error,
-                "failed to encode document json"
-            );
-            anyhow::Error::new(error).context("failed to encode json")
-        })?;
+        let json = serde_json::to_vec(&value)
+            .inspect_err(|error| {
+                error!(
+                    tenant_id = tenant_id,
+                    collection = collection_name,
+                    document_id = document_id,
+                    error = %error,
+                    "failed to encode document json"
+                );
+            })
+            .encode_context("document json")?;
         let doc = PutDocRequest {
             tenant_id: tenant_id.to_string(),
             collection: collection_name.to_string(),
@@ -538,16 +567,20 @@ impl RociaDbClient {
             json,
             request_id: format!("upsert_document:{}:{}", collection_name, Uuid::new_v4()),
         };
-        self.upstream_document.put_doc(doc).await.map_err(|error| {
-            error!(
-                tenant_id = tenant_id,
-                collection = collection_name,
-                document_id = document_id,
-                error = %error,
-                "failed to upsert document"
-            );
-            anyhow::Error::new(error)
-        })?;
+        let mut upstream_document = self.upstream_document.clone();
+        upstream_document
+            .put_doc(doc)
+            .await
+            .inspect_err(|error| {
+                error!(
+                    tenant_id = tenant_id,
+                    collection = collection_name,
+                    document_id = document_id,
+                    error = %error,
+                    "failed to upsert document"
+                );
+            })
+            .status_context("failed to upsert document")?;
         info!(
             tenant_id = tenant_id,
             collection = collection_name,
@@ -567,7 +600,7 @@ impl RociaDbClient {
                 "collection": collection_name,
                 "id": document_id,
             }))
-            .map_err(|error| {
+            .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
                     collection = collection_name,
@@ -577,8 +610,8 @@ impl RociaDbClient {
                     error = %error,
                     "failed to encode node json"
                 );
-                anyhow::Error::new(error).context("failed to encode node json")
-            })?;
+            })
+            .encode_context("node json")?;
             let req = PutNodeRequest {
                 tenant_id: tenant_id.to_string(),
                 graph: graph.clone(),
@@ -586,18 +619,22 @@ impl RociaDbClient {
                 json,
                 request_id: format!("upsert_node:{}", Uuid::new_v4()),
             };
-            self.upstream_graph.put_node(req).await.map_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    graph = %graph,
-                    label = %label,
-                    error = %error,
-                    "failed to upsert graph node binding"
-                );
-                anyhow::Error::new(error)
-            })?;
+            let mut upstream_graph = self.upstream_graph.clone();
+            upstream_graph
+                .put_node(req)
+                .await
+                .inspect_err(|error| {
+                    error!(
+                        tenant_id = tenant_id,
+                        collection = collection_name,
+                        document_id = document_id,
+                        graph = %graph,
+                        label = %label,
+                        error = %error,
+                        "failed to upsert graph node binding"
+                    );
+                })
+                .status_context("failed to upsert graph node binding")?;
             info!(
                 tenant_id = tenant_id,
                 collection = collection_name,
@@ -611,7 +648,7 @@ impl RociaDbClient {
     }
 
     pub async fn search_documents<T>(
-        &mut self,
+        &self,
         tenant_id: &str,
         collection_name: &str,
         search_field: &str,
@@ -632,26 +669,29 @@ impl RociaDbClient {
         );
         let page = page_request(limit, cursor)?;
 
-        let result = self
-            .upstream_document
+        let value_json = serde_json::to_vec(value)
+            .inspect_err(|error| {
+                error!(
+                    tenant_id = tenant_id,
+                    collection = collection_name,
+                    search_field = search_field,
+                    error = %error,
+                    "failed to encode search value"
+                );
+            })
+            .encode_context("search value")?;
+
+        let mut upstream_document = self.upstream_document.clone();
+        let result = upstream_document
             .find_by_field(FindByFieldRequest {
                 tenant_id: tenant_id.to_string(),
                 collection: collection_name.to_string(),
                 field: search_field.to_string(),
-                value_json: serde_json::to_vec(value).map_err(|error| {
-                    error!(
-                        tenant_id = tenant_id,
-                        collection = collection_name,
-                        search_field = search_field,
-                        error = %error,
-                        "failed to encode search value"
-                    );
-                    anyhow::Error::new(error).context("failed to encode search value")
-                })?,
+                value_json,
                 page,
             })
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
                     collection = collection_name,
@@ -659,16 +699,16 @@ impl RociaDbClient {
                     error = %error,
                     "failed to search documents"
                 );
-                anyhow::Error::new(error)
-            })?
+            })
+            .status_context("failed to search documents")?
             .into_inner();
 
         let resp = result
             .json
             .into_iter()
             .map(|data| serde_json::from_slice::<T>(&data))
-            .collect::<Result<Vec<T>, serde_json::Error>>()
-            .map_err(|error| {
+            .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
+            .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
                     collection = collection_name,
@@ -676,8 +716,8 @@ impl RociaDbClient {
                     error = %error,
                     "failed to decode search results"
                 );
-                anyhow::Error::new(error)
-            })?;
+            })
+            .decode_context("search results")?;
 
         let next_cursor = result
             .page
@@ -696,7 +736,7 @@ impl RociaDbClient {
     }
 
     pub async fn list_documents<T>(
-        &mut self,
+        &self,
         tenant_id: &str,
         collection_name: &str,
         limit: Option<u32>,
@@ -713,39 +753,39 @@ impl RociaDbClient {
             "listing documents"
         );
         let page = page_request(limit, cursor)?;
-        let result = self
-            .upstream_document
+        let mut upstream_document = self.upstream_document.clone();
+        let result = upstream_document
             .list_doc(ListDocRequest {
                 tenant_id: tenant_id.to_string(),
                 collection: collection_name.to_string(),
                 page,
             })
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
                     collection = collection_name,
                     error = %error,
                     "failed to list documents"
                 );
-                anyhow::Error::new(error)
-            })?
+            })
+            .status_context("failed to list documents")?
             .into_inner();
 
         let resp = result
             .json
             .into_iter()
             .map(|data| serde_json::from_slice::<T>(&data))
-            .collect::<Result<Vec<T>, serde_json::Error>>()
-            .map_err(|error| {
+            .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
+            .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
                     collection = collection_name,
                     error = %error,
                     "failed to decode listed documents"
                 );
-                anyhow::Error::new(error)
-            })?;
+            })
+            .decode_context("listed documents")?;
 
         let next_cursor = result
             .page
@@ -779,7 +819,7 @@ impl RociaDbClient {
     /// FR: Returns:
     /// - Une page de `CollectionInfo`, chacun portant son nombre de documents.
     pub async fn list_collections(
-        &mut self,
+        &self,
         tenant_id: &str,
         limit: Option<u32>,
         cursor: Option<&str>,
@@ -790,21 +830,21 @@ impl RociaDbClient {
             cursor = cursor.unwrap_or(""),
             "listing collections"
         );
-        let result = self
-            .upstream_document
+        let mut upstream_document = self.upstream_document.clone();
+        let result = upstream_document
             .list_collections(ListCollectionsRequest {
                 tenant_id: tenant_id.to_string(),
                 page: page_request(limit, cursor)?,
             })
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
                     error = %error,
                     "failed to list collections"
                 );
-                anyhow::Error::new(error)
-            })?
+            })
+            .status_context("failed to list collections")?
             .into_inner();
 
         Ok(Page {
@@ -823,7 +863,7 @@ impl RociaDbClient {
     /// la liste de tri dans l ordre fourni. Le `next_cursor` retourne est
     /// opaque et doit etre reutilise tel quel.
     pub async fn query_documents<T>(
-        &mut self,
+        &self,
         tenant_id: &str,
         collection_name: &str,
         filters: &[DocumentQueryFilter],
@@ -856,8 +896,8 @@ impl RociaDbClient {
                         .values
                         .iter()
                         .map(serde_json::to_vec)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|error| {
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .inspect_err(|error| {
                             error!(
                                 tenant_id = tenant_id,
                                 collection = collection_name,
@@ -865,8 +905,8 @@ impl RociaDbClient {
                                 error = %error,
                                 "failed to encode query filter value"
                             );
-                            anyhow::Error::new(error).context("failed to encode query filter value")
-                        })?,
+                        })
+                        .encode_context("query filter value")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -879,8 +919,8 @@ impl RociaDbClient {
             })
             .collect::<Vec<_>>();
 
-        let result = self
-            .upstream_document
+        let mut upstream_document = self.upstream_document.clone();
+        let result = upstream_document
             .query_doc(QueryDocRequest {
                 tenant_id: tenant_id.to_string(),
                 collection: collection_name.to_string(),
@@ -889,31 +929,31 @@ impl RociaDbClient {
                 page,
             })
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
                     collection = collection_name,
                     error = %error,
                     "failed to query documents"
                 );
-                anyhow::Error::new(error)
-            })?
+            })
+            .status_context("failed to query documents")?
             .into_inner();
 
         let resp = result
             .json
             .into_iter()
             .map(|data| serde_json::from_slice::<T>(&data))
-            .collect::<Result<Vec<T>, serde_json::Error>>()
-            .map_err(|error| {
+            .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
+            .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
                     collection = collection_name,
                     error = %error,
                     "failed to decode queried documents"
                 );
-                anyhow::Error::new(error)
-            })?;
+            })
+            .decode_context("queried documents")?;
 
         let next_cursor = result
             .page
@@ -929,8 +969,9 @@ impl RociaDbClient {
 
         Ok((resp, next_cursor, result.total_count))
     }
+
     pub async fn get_document<T>(
-        &mut self,
+        &self,
         tenant_id: &str,
         collection_name: &str,
         document_id: &str,
@@ -944,15 +985,15 @@ impl RociaDbClient {
             document_id = document_id,
             "loading document"
         );
-        let result = self
-            .upstream_document
+        let mut upstream_document = self.upstream_document.clone();
+        let result = upstream_document
             .get_doc(GetDocRequest {
                 tenant_id: tenant_id.to_string(),
                 collection: collection_name.to_string(),
                 id: document_id.to_string(),
             })
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
                     collection = collection_name,
@@ -960,20 +1001,21 @@ impl RociaDbClient {
                     error = %error,
                     "failed to load document"
                 );
-                anyhow::Error::new(error)
-            })?
+            })
+            .status_context("failed to load document")?
             .into_inner();
 
-        let resp = serde_json::from_slice::<T>(&result.json).map_err(|error| {
-            error!(
-                tenant_id = tenant_id,
-                collection = collection_name,
-                document_id = document_id,
-                error = %error,
-                "failed to decode document"
-            );
-            anyhow::Error::new(error)
-        })?;
+        let resp = serde_json::from_slice::<T>(&result.json)
+            .inspect_err(|error| {
+                error!(
+                    tenant_id = tenant_id,
+                    collection = collection_name,
+                    document_id = document_id,
+                    error = %error,
+                    "failed to decode document"
+                );
+            })
+            .decode_context("document")?;
         debug!(
             tenant_id = tenant_id,
             collection = collection_name,
@@ -1016,8 +1058,8 @@ impl RociaDbClient {
         );
         stream::iter(data)
             .map(|((label, id), value)| {
-                let json = serde_json::to_vec(&value).context("failed to encode node json")?;
-                Ok::<PutNodeRequest, anyhow::Error>(PutNodeRequest {
+                let json = serde_json::to_vec(&value).encode_context("node json")?;
+                Ok::<PutNodeRequest, RociaDbError>(PutNodeRequest {
                     tenant_id: tenant_id.clone(),
                     graph: graph_name.clone(),
                     node_id: format!("{}:{}", label, id),
@@ -1033,7 +1075,7 @@ impl RociaDbClient {
                     upstream
                         .put_node(node)
                         .await
-                        .context("failed to upsert node")
+                        .status_context("failed to upsert node")
                         .map_err(|error| {
                             error!(
                                 graph = graph,
@@ -1055,17 +1097,6 @@ impl RociaDbClient {
         Ok(())
     }
 
-    /// Backward-compatible alias for [`RociaDbClient::put_nodes`].
-    #[deprecated(since = "0.2.0", note = "use `put_nodes` instead")]
-    pub async fn node_upsert(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        data: HashMap<(String, String), Value>,
-    ) -> Result<()> {
-        self.put_nodes(tenant_id, graph_name, data).await
-    }
-
     /// EN: Fetch a node and decode its JSON payload.
     /// FR: Recupere un node et decode son JSON.
     ///
@@ -1083,7 +1114,7 @@ impl RociaDbClient {
     /// FR: Returns:
     /// - Payload JSON decode.
     pub async fn get_node(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph_name: &str,
         node_id: &str,
@@ -1094,15 +1125,15 @@ impl RociaDbClient {
             node_id = node_id,
             "loading graph node"
         );
-        let resp = self
-            .upstream_graph
+        let mut upstream_graph = self.upstream_graph.clone();
+        let resp = upstream_graph
             .get_node(GetNodeRequest {
                 tenant_id: tenant_id.to_string(),
                 graph: graph_name.to_string(),
                 node_id: node_id.to_string(),
             })
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
                     graph = graph_name,
@@ -1110,19 +1141,20 @@ impl RociaDbClient {
                     error = %error,
                     "failed to load graph node"
                 );
-                anyhow::Error::new(error)
-            })?
+            })
+            .status_context("failed to load graph node")?
             .into_inner();
-        let value = serde_json::from_slice(&resp.json).map_err(|error| {
-            error!(
-                tenant_id = tenant_id,
-                graph = graph_name,
-                node_id = node_id,
-                error = %error,
-                "failed to decode node json"
-            );
-            anyhow::Error::new(error).context("failed to decode node json")
-        })?;
+        let value = serde_json::from_slice(&resp.json)
+            .inspect_err(|error| {
+                error!(
+                    tenant_id = tenant_id,
+                    graph = graph_name,
+                    node_id = node_id,
+                    error = %error,
+                    "failed to decode node json"
+                );
+            })
+            .decode_context("node json")?;
         debug!(
             tenant_id = tenant_id,
             graph = graph_name,
@@ -1171,7 +1203,7 @@ impl RociaDbClient {
         );
         stream::iter(edges)
             .map(|((from, to, label, id), data)| {
-                let json = serde_json::to_vec(&data).context("failed to encode edge json")?;
+                let json = serde_json::to_vec(&data).encode_context("edge json")?;
                 let edge_id = id;
                 debug!(
                     tenant_id = tenant_id,
@@ -1183,7 +1215,7 @@ impl RociaDbClient {
                     "prepared graph edge upsert"
                 );
 
-                Ok::<AddEdgeRequest, anyhow::Error>(AddEdgeRequest {
+                Ok::<AddEdgeRequest, RociaDbError>(AddEdgeRequest {
                     tenant_id: tenant_id.clone(),
                     graph: graph_name.clone(),
                     edge_id,
@@ -1205,7 +1237,7 @@ impl RociaDbClient {
                     upstream
                         .add_edge(edge)
                         .await
-                        .context("failed to add edge")
+                        .status_context("failed to add edge")
                         .map_err(|error| {
                             error!(
                                 graph = graph,
@@ -1231,102 +1263,6 @@ impl RociaDbClient {
         Ok(())
     }
 
-    /// Backward-compatible alias for [`RociaDbClient::add_edges`].
-    #[deprecated(since = "0.2.0", note = "use `add_edges` instead")]
-    pub async fn edges_upsert(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        edges: HashMap<(String, String, String, String), Value>,
-    ) -> Result<()> {
-        self.add_edges(tenant_id, graph_name, edges).await
-    }
-
-    /// EN: Get outgoing neighbors and fetch their node payloads.
-    /// FR: Recupere les voisins sortants et charge leurs nodes.
-    ///
-    /// EN: Arguments:
-    /// - `tenant_id`: Tenant identifier.
-    /// - `graph_name`: Graph name.
-    /// - `node_id`: Source node id.
-    /// - `edge_label`: Edge label filter.
-    /// FR: Arguments:
-    /// - `tenant_id`: Identifiant du tenant.
-    /// - `graph_name`: Nom du graph.
-    /// - `node_id`: Id du node source.
-    /// - `edge_label`: Filtre sur le label d edge.
-    ///
-    /// EN: Returns:
-    /// - Vec of `(edge_id, label, id, node)` tuples.
-    /// FR: Returns:
-    /// - Vec de tuples `(edge_id, label, id, node)`.
-    ///
-    /// EN: Implemented on top of
-    /// [`RociaDbClient::get_outgoing_neighbor_nodes`], which paginates
-    /// correctly: it only ever stops on an absent `next_cursor`. The
-    /// previous implementation of this method paginated on its own and
-    /// stopped as soon as one page came back empty or short — since the
-    /// server can legitimately return an empty or short page in the middle
-    /// of a listing (a stale index entry pointing at a deleted node, for
-    /// example) followed by more data, that silently dropped every
-    /// remaining page. Prefer
-    /// [`RociaDbClient::get_outgoing_neighbor_nodes`] directly for typed
-    /// payloads.
-    /// FR: Implementee au-dessus de
-    /// [`RociaDbClient::get_outgoing_neighbor_nodes`], qui pagine
-    /// correctement : elle ne s arrete jamais que sur un `next_cursor`
-    /// absent. L ancienne implementation de cette methode paginait elle-
-    /// meme et s arretait des qu une page revenait vide ou courte — or le
-    /// serveur peut legitimement renvoyer une page vide ou courte au milieu
-    /// d un listing (une entree d index perimee pointant vers un node
-    /// supprime, par exemple) suivie d autres donnees, ce qui perdait
-    /// silencieusement toutes les pages restantes. Preferez
-    /// [`RociaDbClient::get_outgoing_neighbor_nodes`] directement pour des
-    /// payloads types.
-    #[deprecated(
-        since = "0.2.0",
-        note = "use `get_outgoing_neighbor_nodes` for typed payloads"
-    )]
-    pub async fn get_neighbors_nodes(
-        &mut self,
-        tenant_id: &str,
-        graph_name: &str,
-        node_id: &str,
-        edge_label: &str,
-    ) -> Result<Vec<(String, String, String, GetNodeResponse)>> {
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            node_id = node_id,
-            edge_label = edge_label,
-            "loading outgoing neighbors"
-        );
-        let neighbors: Vec<NeighborNode<Value>> = self
-            .get_outgoing_neighbor_nodes(tenant_id, graph_name, node_id, edge_label)
-            .await?;
-
-        let mut all_nodes = Vec::with_capacity(neighbors.len());
-        for neighbor in neighbors {
-            let (label, id) = neighbor
-                .node_id
-                .split_once(':')
-                .map(|(l, i)| (l.to_string(), i.to_string()))
-                .with_context(|| format!("invalid graph node id: {}", neighbor.node_id))?;
-            let json = serde_json::to_vec(&neighbor.value)
-                .context("failed to re-encode neighbor node json")?;
-            all_nodes.push((neighbor.edge_id, label, id, GetNodeResponse { json }));
-        }
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            node_id = node_id,
-            edge_label = edge_label,
-            neighbor_count = all_nodes.len(),
-            "outgoing neighbors loaded"
-        );
-        Ok(all_nodes)
-    }
-
     /// EN: Delete an edge by id.
     /// FR: Supprime un edge par id.
     ///
@@ -1344,7 +1280,7 @@ impl RociaDbClient {
     /// FR: Returns:
     /// - `()` en cas de succes.
     pub async fn delete_edge(
-        &mut self,
+        &self,
         tenant_id: &str,
         graph_name: &str,
         edge_id: &str,
@@ -1374,7 +1310,8 @@ impl RociaDbClient {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_node_binding;
+    use super::{RociaDbClient, validate_node_binding};
+    use crate::RociaDbError;
 
     #[test]
     fn node_binding_accepts_both_absent() {
@@ -1391,13 +1328,45 @@ mod tests {
     fn node_binding_rejects_label_without_graph() {
         let error = validate_node_binding(&Some("product".to_string()), &None)
             .expect_err("node_label without node_graph must be rejected");
+        // EN: This is a client-side validation rule, so it must come back
+        // as `RociaDbError::Validation`, not folded into some catch-all
+        // variant, and the message must stay informative.
+        // FR: C est une regle de validation cote client, elle doit donc
+        // revenir en `RociaDbError::Validation`, pas noyee dans une
+        // variante fourre-tout, et le message doit rester informatif.
+        assert!(matches!(error, RociaDbError::Validation(_)));
         assert!(error.to_string().contains("must be provided together"));
+        assert!(error.to_string().contains("node_label=Some(\"product\")"));
     }
 
     #[test]
     fn node_binding_rejects_graph_without_label() {
         let error = validate_node_binding(&None, &Some("products".to_string()))
             .expect_err("node_graph without node_label must be rejected");
+        assert!(matches!(error, RociaDbError::Validation(_)));
         assert!(error.to_string().contains("must be provided together"));
+        assert!(error.to_string().contains("node_graph=Some(\"products\")"));
+    }
+
+    #[test]
+    fn client_is_send_sync_so_an_arc_needs_no_mutex() {
+        // EN: `RociaDbClient` methods take `&self`, not `&mut self` (each
+        // call clones the cheap, Arc-backed inner service client before
+        // issuing its RPC). This is only sound to share across tasks if
+        // the type is both `Send` and `Sync`: a plain compile-time trait
+        // assertion, not a runtime check, but it locks in the intent so a
+        // future field that breaks it fails the build instead of shipping
+        // silently.
+        // FR: Les methodes de `RociaDbClient` prennent `&self`, pas `&mut
+        // self` (chaque appel clone le client de service interne, peu
+        // couteux car adosse a un Arc, avant d emettre son RPC). Ce n est
+        // valide a partager entre taches que si le type est a la fois
+        // `Send` et `Sync` : une simple assertion de trait a la
+        // compilation, pas une verification a l execution, mais elle fige
+        // l intention pour qu un futur champ qui la casserait fasse
+        // echouer le build plutot que de partir en silence.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RociaDbClient>();
+        assert_send_sync::<std::sync::Arc<RociaDbClient>>();
     }
 }

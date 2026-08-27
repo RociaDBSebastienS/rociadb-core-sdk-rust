@@ -1185,9 +1185,8 @@ dependencies = [
 
 [[package]]
 name = "rocia-db-sdk"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
- "anyhow",
  "futures",
  "pbjson-types",
  "prost",
@@ -1196,6 +1195,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
  "tokio",
  "tonic",
  "tonic-prost",

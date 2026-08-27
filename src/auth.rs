@@ -2,7 +2,8 @@
 //! FR: Helpers auth pour tokens bearer et cles API.
 #![allow(clippy::doc_lazy_continuation)]
 
-use anyhow::{Context, Result, anyhow};
+use crate::error::AuthResultExt;
+use crate::{Result, RociaDbError};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -62,11 +63,13 @@ pub async fn fetch_token(
         ])
         .send()
         .await
-        .context("token request failed")?
+        .auth_context("token request failed")?
         .error_for_status()
-        .context("token endpoint returned error")?;
+        .auth_context("token endpoint returned error")?;
 
-    Ok(res.json::<TokenResponse>().await?)
+    res.json::<TokenResponse>()
+        .await
+        .auth_context("failed to parse token response")
 }
 
 /// EN: Token manager with cached authorization header.
@@ -185,7 +188,7 @@ impl TokenManager {
             .inner
             .header_value
             .write()
-            .map_err(|_| anyhow!("token header lock poisoned"))?;
+            .map_err(|_| RociaDbError::auth("token header lock poisoned"))?;
         *guard = header;
         Ok(())
     }
@@ -234,8 +237,8 @@ impl TokenManager {
 fn build_header(token: &TokenResponse) -> Result<MetadataValue<Ascii>> {
     let bearer = format!("{} {}", token.token_type, token.access_token);
     bearer
-        .parse()
-        .context("invalid access token metadata value")
+        .parse::<MetadataValue<Ascii>>()
+        .auth_context("invalid access token metadata value")
 }
 
 /// EN: Drop guard for the refresh task.
@@ -296,7 +299,7 @@ impl BearerInterceptor {
 }
 
 impl Interceptor for BearerInterceptor {
-    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+    fn call(&mut self, mut req: Request<()>) -> std::result::Result<Request<()>, Status> {
         if let Some(header_value) = self.header_value.as_ref() {
             let header_value = header_value
                 .read()
@@ -338,7 +341,7 @@ impl ApiKeyInterceptor {
 }
 
 impl Interceptor for ApiKeyInterceptor {
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+    fn call(&mut self, request: Request<()>) -> std::result::Result<Request<()>, Status> {
         match request
             .metadata()
             .get(&self.header)
