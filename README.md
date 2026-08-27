@@ -31,8 +31,16 @@ chemin depuis un checkout voisin, ou comme dependance git :
 # From a sibling checkout:
 rocia-db-sdk = { path = "../rocia-db-sdk-rust" }
 # Or pinned to a tag from git:
-# rocia-db-sdk = { git = "https://github.com/RociaDBSebastienS/rociadb-core-sdk-rust", tag = "v0.3.0" }
+# rocia-db-sdk = { git = "https://github.com/RociaDBSebastienS/rociadb-core-sdk-rust", tag = "v0.6.0" }
 ```
+
+EN: `Cargo.toml` declares `rust-version = "1.85"` (the first stable release
+supporting `edition = "2024"`) — the minimum toolchain this crate is built
+and tested against, mirroring the TypeScript SDK's `engines.node: ">=20"`.
+FR: `Cargo.toml` declare `rust-version = "1.85"` (la premiere version stable
+supportant `edition = "2024"`) — le toolchain minimum avec lequel cette
+crate est construite et testee, en miroir du `engines.node: ">=20"` du SDK
+TypeScript.
 
 ## Quick Start
 
@@ -159,6 +167,47 @@ FR: Chaque statut gRPC porte aussi une metadonnee `reason` (`invalid_argument`,
 `not_found`, `already_exists`, `permission_denied`, `unauthenticated`,
 `internal`) qui precise la cause plus finement que le seul code gRPC.
 
+### Two ways to recover from `UNAUTHENTICATED`
+
+EN: `refresh_auth_token()` (above) is **eager**: it awaits the round trip to
+the identity provider and only returns once a fresh token is confirmed and
+in hand, or propagates the fetch error otherwise — the right choice right
+before retrying the call that just failed. `invalidate_auth_token()` is its
+**lazy** counterpart: it is synchronous, returns immediately, and only wakes
+the background refresh task so it fetches a fresh token at its next
+opportunity — nobody pays for the network round trip inline. Reach for it
+when you just want to mark the cached token stale (a fire-and-forget error
+handler, for example) without blocking the current call on a fresh token
+being in hand first:
+FR: `refresh_auth_token()` (ci-dessus) est **eager** (avide) : il attend
+l aller-retour vers le fournisseur d identite et ne retourne qu une fois un
+nouveau token confirme et en main, ou propage l erreur de recuperation
+sinon — le bon choix juste avant de rejouer l appel qui vient d echouer.
+`invalidate_auth_token()` en est le pendant **paresseux** : il est
+synchrone, retourne immediatement, et se contente de reveiller la tache de
+refresh en arriere-plan pour qu elle recupere un token frais a la prochaine
+occasion — personne ne paie l aller-retour reseau en ligne. Utilisez-le
+quand vous voulez juste marquer le token en cache comme perime (un
+gestionnaire d erreur fire-and-forget, par exemple) sans bloquer l appel en
+cours sur un token frais deja en main :
+
+```rust
+// Somewhere that observed an UNAUTHENTICATED but is not the caller that
+// needs to retry immediately (a background health check, for example):
+// signal staleness and move on — no `.await`, no network call here.
+client.invalidate_auth_token();
+```
+
+EN: Both are no-ops when the client was built with `RociaDbBuilder::disable_auth`.
+Neither ever discards a still-valid cached token just because a background
+refresh attempt failed: the interceptor keeps injecting the last known-good
+token until a replacement is confirmed.
+FR: Les deux sont des no-ops quand le client a ete construit avec
+`RociaDbBuilder::disable_auth`. Aucun des deux ne jette jamais un token en
+cache encore valide simplement parce qu une tentative de refresh en
+arriere-plan a echoue : l interceptor continue d injecter le dernier token
+connu comme bon jusqu a ce qu un remplacant soit confirme.
+
 ### Default Auth Behavior
 
 EN: Authentication is enabled by default in `RociaDbBuilder`.
@@ -236,6 +285,49 @@ with `UNAVAILABLE`.
 FR: Le proxy doit etre configure en HTTP/2 de bout en bout (pas de
 retrogradation TLS vers HTTP/1.1 cote backend), sinon tous les appels gRPC
 echouent immediatement, generalement avec `UNAVAILABLE`.
+
+### Host validation and connect timeout
+
+EN: `.host(...)` must be a bare `scheme://host:port` — no path component
+beyond an absent one or a lone `/`. `RociaDbBuilder::build` rejects anything
+else (`RociaDbError::Connection`) before attempting a connection, so a
+mistyped host with a leftover path (`http://127.0.0.1:50051/v1`, pasted from
+somewhere else) fails loudly instead of tonic silently ignoring the path
+component and dialing the host anyway.
+FR: `.host(...)` doit etre un simple `scheme://host:port` — sans composante
+de chemin au-dela d une absente ou d un simple `/`. `RociaDbBuilder::build`
+rejette tout le reste (`RociaDbError::Connection`) avant meme de tenter une
+connexion, de sorte qu un host mal saisi avec un chemin residuel
+(`http://127.0.0.1:50051/v1`, colle depuis ailleurs) echoue bruyamment
+plutot que tonic n ignore silencieusement la composante chemin et ne
+compose quand meme le host.
+
+EN: `RociaDbBuilder::connect_timeout` sets the deadline applied while
+connecting. It defaults to **10 seconds** if never called — `build()`
+always applies some connect timeout, so a slow or unreachable DNS/TCP
+target fails after a bounded wait instead of hanging `.await` forever.
+FR: `RociaDbBuilder::connect_timeout` definit le delai applique pendant la
+connexion. Il vaut **10 secondes** par defaut si jamais appele — `build()`
+applique toujours un delai de connexion, de sorte qu une cible DNS/TCP
+lente ou injoignable echoue apres une attente bornee plutot que de bloquer
+`.await` indefiniment.
+
+```rust
+use rocia_db_sdk::RociaDbBuilder;
+use std::time::Duration;
+
+let client = RociaDbBuilder::new()
+    .host("https://rociadb.internal:50051")
+    .connect_timeout(Duration::from_secs(3))
+    .auth_client_credentials("https://example.com/token", "client-id", "client-secret")
+    .build()
+    .await?;
+```
+
+EN: A zero-duration timeout is rejected with `RociaDbError::Validation` at
+`build()` time, before any connection attempt.
+FR: Un delai de duree nulle est rejete avec `RociaDbError::Validation` au
+moment du `build()`, avant toute tentative de connexion.
 
 ## Batch Operations
 
@@ -360,25 +452,51 @@ d autres donnees.
 ## File Operations
 
 EN: `upload_file` and `download_file` are ergonomic in-memory helpers; the
-underlying gRPC contract they implement is stricter than it looks and worth
-understanding even if you never touch `upload_file_stream` directly.
+underlying gRPC contract they implement is worth understanding even if you
+never touch `upload_file_chunked` or `upload_file_stream` directly. There
+are three levels of upload help, from most to least hand-holding:
+`upload_file` (buffers the whole file, computes the checksum for you),
+`upload_file_chunked` (streams arbitrarily-sized pieces without buffering
+the whole file, but you supply the checksum), and `upload_file_stream` (a
+raw pass-through — you build every protobuf message yourself). All three
+are covered below.
 FR: `upload_file` et `download_file` sont des aides ergonomiques en memoire ;
-le contrat gRPC sous-jacent qu elles implementent est plus strict qu il n y
-parait et vaut la peine d etre compris meme si vous ne touchez jamais
-directement a `upload_file_stream`.
+le contrat gRPC sous-jacent qu elles implementent vaut la peine d etre
+compris meme si vous ne touchez jamais directement a `upload_file_chunked`
+ou `upload_file_stream`. Il y a trois niveaux d aide a l upload, du plus au
+moins assiste : `upload_file` (bufferise tout le fichier, calcule le
+checksum pour vous), `upload_file_chunked` (streame des morceaux de taille
+quelconque sans bufferiser tout le fichier, mais vous fournissez le
+checksum), et `upload_file_stream` (un passe-plat brut — vous construisez
+chaque message protobuf vous-meme). Les trois sont couverts ci-dessous.
 
 ### The upload wire contract
 
 EN:
-- The server stores every file as a fixed sequence of exactly **1 MiB**
-  (1,048,576-byte) chunks, and on download it always replays
-  `ceil(size_bytes / 1 MiB)` chunk indexes — regardless of how the upload was
-  actually sliced into messages. Uploading with any chunk size other than
-  exactly 1 MiB (except the last, which may be shorter) makes a later
-  download **silently return truncated or garbled data**: there is no
-  server-side error, because the server has no way to know the upload used a
-  different chunking scheme. `upload_file` always emits exactly-1-MiB chunks
-  for you; this is why `FileUploadOptions` has no `chunk_size` knob.
+- **Chunk size is the client's choice, capped at 1 MiB — it is not a fixed
+  requirement.** As of server `1.0.0-rc.16`, the server stores each chunk
+  verbatim at its position in the stream and, on download, reads chunks back
+  until it has collected `size_bytes` bytes in total — it no longer assumes
+  any particular chunk size when replaying them. A single message's `chunk`
+  larger than 1 MiB is rejected outright with `INVALID_ARGUMENT`
+  (`"chunk exceeds 1 MiB"`); anything at or under that cap is fine, sliced
+  however the client likes. `upload_file` and `upload_file_chunked` (see
+  below) both still always emit exactly-1-MiB chunks (the last one may be
+  shorter) — not because the server requires it, but because 1 MiB is the
+  largest message the server allows, so it is also the fewest possible
+  messages for a given file; this is also why `FileUploadOptions` has no
+  `chunk_size` knob. **Before `rc.16`**, this was a correctness requirement,
+  not just an efficiency choice: the server derived how many chunks to read
+  back on download as `ceil(size_bytes / 1 MiB)`, so any upload chunk size
+  other than exactly 1 MiB made a later download silently return truncated
+  or garbled data, with no server-side error at all. That is why the SDK has
+  always defaulted to exactly-1-MiB chunking, and why it still does: this
+  chunking remains correct and optimal against `rc.16`, and it is the only
+  chunking that stays safe against a pre-`rc.16` server. The same
+  guessed-chunk-count bug affected `Delete` before `rc.16` (it stopped after
+  the same assumed chunk count, leaving a tail of orphaned chunks behind for
+  any file that had used a different chunk size); `Delete` now removes a
+  whole file by prefix, regardless of how it was chunked.
 - The **first** message of the upload stream must carry the metadata:
   `tenant_id`, `bucket`, `file_id`, `size_bytes` (the exact total byte
   count), `content_type`, `checksum`, and `request_id`. Every later message
@@ -391,11 +509,15 @@ EN:
   automatically when `FileUploadOptions.checksum` is `None`; if you supply
   your own, it must be exactly 32 bytes or the call fails client-side,
   before any network call.
-- Each message's `chunk` must not exceed 1 MiB, or the server rejects it
-  with `INVALID_ARGUMENT` (`"chunk exceeds 1 MiB"`). The sum of every
-  `chunk`'s bytes across the stream must equal `size_bytes` exactly, or the
-  server rejects the upload with `INVALID_ARGUMENT`
-  (`"size_bytes does not match uploaded data"`).
+- The sum of every `chunk`'s bytes across the stream must equal `size_bytes`
+  exactly, or the server rejects the upload with `INVALID_ARGUMENT`
+  (`"size_bytes does not match uploaded data"`) at the end of the stream —
+  this is what makes `size_bytes` a value the SDK (and the server, on
+  download) can trust, rather than just a caller-supplied claim.
+- Re-uploading an existing `file_id` **replaces it, with no error for the
+  duplicate** — there is no separate delete-then-upload dance required. The
+  content served by `download_file`/`stat_file` afterward is always the
+  newest upload.
 - Files over the server's `limits.max_file_bytes` (**5 GiB by default**) are
   rejected. `upload_file` checks this client-side and returns a clear error
   before sending anything.
@@ -408,16 +530,33 @@ EN:
   eventually reclaims; the partial file never appears anywhere.
 
 FR:
-- Le serveur stocke chaque fichier en une sequence fixe de chunks d
-  exactement **1 MiB** (1 048 576 octets), et au download il relit toujours
-  les index `ceil(size_bytes / 1 MiB)` — quel que soit le decoupage reel de
-  l upload en messages. Uploader avec une taille de chunk differente de 1
-  MiB exactement (sauf le dernier, qui peut etre plus court) fait qu un
-  download ulterieur **renvoie silencieusement des donnees tronquees ou
-  corrompues** : il n y a pas d erreur cote serveur, car le serveur n a
-  aucun moyen de savoir que l upload a utilise un decoupage different.
-  `upload_file` emet toujours des chunks d exactement 1 MiB pour vous ; c est
-  pourquoi `FileUploadOptions` n a pas de reglage `chunk_size`.
+- **La taille de chunk est le choix du client, plafonnee a 1 MiB — ce n est
+  pas une exigence fixe.** Depuis le serveur `1.0.0-rc.16`, le serveur
+  stocke chaque chunk tel quel a sa position dans le flux et, au download,
+  relit des chunks jusqu a avoir recueilli au total `size_bytes` octets — il
+  ne suppose plus aucune taille de chunk particuliere en les relisant. Un
+  message dont le `chunk` depasse 1 MiB est rejete directement avec
+  `INVALID_ARGUMENT` (`"chunk exceeds 1 MiB"`) ; tout ce qui est a la limite
+  ou en dessous convient, decoupe comme le client le souhaite. `upload_file`
+  et `upload_file_chunked` (voir plus bas) emettent tous deux toujours des
+  chunks d exactement 1 MiB (le dernier peut etre plus court) — non pas
+  parce que le serveur l exige, mais parce que 1 MiB est le plus gros
+  message que le serveur autorise, donc aussi le moins de messages possible
+  pour un fichier donne ; c est aussi pourquoi `FileUploadOptions` n a pas de
+  reglage `chunk_size`. **Avant `rc.16`**, c etait une exigence de
+  correction, pas seulement un choix d efficacite : le serveur deduisait le
+  nombre de chunks a relire au download comme `ceil(size_bytes / 1 MiB)`,
+  donc toute taille de chunk d upload differente de 1 MiB exactement faisait
+  qu un download ulterieur renvoyait silencieusement des donnees tronquees
+  ou corrompues, sans aucune erreur cote serveur. C est pourquoi le SDK a
+  toujours decoupe par defaut en chunks d exactement 1 MiB, et pourquoi il
+  continue de le faire : ce decoupage reste correct et optimal face a
+  `rc.16`, et c est le seul decoupage qui reste sur face a un serveur
+  pre-`rc.16`. Le meme bug de nombre de chunks devine affectait `Delete`
+  avant `rc.16` (il s arretait apres le meme nombre de chunks suppose,
+  laissant une queue de chunks orphelins pour tout fichier ayant utilise une
+  autre taille de chunk) ; `Delete` supprime desormais un fichier entier par
+  prefixe, quel que soit son decoupage.
 - Le **premier** message du flux d upload doit porter les metadonnees :
   `tenant_id`, `bucket`, `file_id`, `size_bytes` (le nombre total exact
   d octets), `content_type`, `checksum` et `request_id`. Chaque message
@@ -430,11 +569,16 @@ FR:
   SHA-256 du buffer automatiquement quand `FileUploadOptions.checksum` vaut
   `None` ; si vous en fournissez un vous-meme, il doit faire exactement 32
   octets sinon l appel echoue cote client, avant tout appel reseau.
-- Le `chunk` de chaque message ne doit pas depasser 1 MiB, sinon le serveur
-  le rejette avec `INVALID_ARGUMENT` (`"chunk exceeds 1 MiB"`). La somme des
-  octets de `chunk` sur tout le flux doit egaler exactement `size_bytes`,
-  sinon le serveur rejette l upload avec `INVALID_ARGUMENT`
-  (`"size_bytes does not match uploaded data"`).
+- La somme des octets de `chunk` sur tout le flux doit egaler exactement
+  `size_bytes`, sinon le serveur rejette l upload avec `INVALID_ARGUMENT`
+  (`"size_bytes does not match uploaded data"`) a la fin du flux — c est ce
+  qui fait de `size_bytes` une valeur a laquelle le SDK (et le serveur, au
+  download) peuvent faire confiance, pas seulement une declaration de
+  l appelant.
+- Reuploader un `file_id` deja existant **le remplace, sans erreur pour le
+  doublon** — aucune danse suppression-puis-upload n est necessaire. Le
+  contenu servi par `download_file`/`stat_file` ensuite est toujours celui
+  du dernier upload.
 - Les fichiers au-dela de `limits.max_file_bytes` cote serveur (**5 GiB par
   defaut**) sont rejetes. `upload_file` verifie cela cote client et retourne
   une erreur claire avant d envoyer quoi que ce soit.
@@ -470,19 +614,114 @@ let bytes = client.download_file("tenant-1", "assets", "manual.txt").await?;
 client.delete_file("tenant-1", "assets", "manual.txt").await?;
 ```
 
+### Streaming an upload without buffering the whole file
+
+EN: `upload_file_chunked` is the middle tier between `upload_file` (buffers
+the whole file, computes the checksum for you) and `upload_file_stream`
+(a raw pass-through with zero validation — see below). Give it a
+`Stream<Item = Vec<u8>>` of arbitrarily-sized pieces — however the source
+naturally produces them, a `64 KiB` `AsyncRead` wrapper, messages from
+another stream, anything — and it re-buffers internally, always emitting
+exactly-1-MiB gRPC messages to the server, the same chunking `upload_file`
+produces from an in-memory buffer. `size_bytes` and `checksum` (the 32-byte
+SHA-256 digest of the complete file) must both be supplied up front,
+because file metadata travels on the very first gRPC message, before this
+method has read a single byte from `chunks` — hash the source ahead of time
+(a first pass over the file, for example) if you only have raw bytes to
+start from. If `chunks` ends up producing more or fewer total bytes than
+`size_bytes` declared, this fails client-side with
+`RociaDbError::Validation` instead of sending a stream the server would
+reject anyway at the end.
+FR: `upload_file_chunked` est le palier intermediaire entre `upload_file`
+(bufferise tout le fichier, calcule le checksum pour vous) et
+`upload_file_stream` (un passe-plat brut sans aucune validation — voir plus
+bas). Donnez-lui un `Stream<Item = Vec<u8>>` de morceaux de taille
+quelconque — comme la source les produit naturellement, un wrapper
+`AsyncRead` en `64 KiB`, des messages venant d un autre flux, n importe quoi
+— et il re-bufferise en interne, en emettant toujours des messages gRPC
+d exactement 1 MiB vers le serveur, le meme decoupage que `upload_file`
+produit depuis un buffer en memoire. `size_bytes` et `checksum` (le digest
+SHA-256 de 32 octets du fichier complet) doivent tous deux etre fournis a
+l avance, car les metadonnees du fichier voyagent sur le tout premier
+message gRPC, avant que cette methode n ait lu le moindre octet de `chunks`
+— hachez la source a l avance (une premiere passe sur le fichier, par
+exemple) si vous n avez que des octets bruts au depart. Si `chunks` finit
+par produire plus ou moins d octets au total que ce que `size_bytes`
+declarait, ceci echoue cote client avec `RociaDbError::Validation` plutot
+que d envoyer un flux que le serveur rejetterait de toute facon a la fin.
+
+```rust
+use rocia_db_sdk::file::FileStreamUploadOptions;
+use futures::stream;
+use sha2::{Digest, Sha256};
+
+let payload = std::fs::read("large-report.csv").expect("read source file");
+let checksum = Sha256::digest(&payload).to_vec();
+let size_bytes = payload.len() as u64;
+
+// Any chunking the source naturally produces — 64 KiB here purely as an
+// example. upload_file_chunked re-slices to the server's 1 MiB messages
+// internally regardless of what you hand it.
+let chunks: Vec<Vec<u8>> = payload.chunks(64 * 1024).map(|c| c.to_vec()).collect();
+
+client
+    .upload_file_chunked(
+        "tenant-1",
+        "reports",
+        "large-report.csv",
+        size_bytes,
+        checksum,
+        stream::iter(chunks),
+        FileStreamUploadOptions {
+            content_type: "text/csv".into(),
+            ..Default::default()
+        },
+    )
+    .await?;
+```
+
+EN: **Naming trap when porting code between SDKs:** despite doing the
+re-chunking and validation, this method is not called `upload_file_stream`
+— that name was already taken in this SDK by the raw, zero-validation
+escape hatch below. The TypeScript SDK's `uploadFileStream` is this
+method's counterpart, not Rust's `upload_file_stream`'s — see
+[Parity with the TypeScript SDK](#parity-with-the-typescript-sdk) for the
+full naming table.
+FR: **Piege de nommage lors du portage de code entre SDKs :** malgre le
+re-decoupage et la validation qu elle effectue, cette methode ne s appelle
+pas `upload_file_stream` — ce nom etait deja pris dans ce SDK par
+l echappatoire brute sans validation ci-dessous. `uploadFileStream` du SDK
+TypeScript est l equivalent de cette methode-ci, pas de
+`upload_file_stream` cote Rust — voir
+[Parity with the TypeScript SDK](#parity-with-the-typescript-sdk) pour le
+tableau de correspondance complet.
+
 EN: For large downloads, prefer `download_file_stream` to avoid buffering
-the complete file in memory. Use `upload_file_stream` only for genuine
-streaming uploads (data that never fits in memory); it is a low-level
-escape hatch that does **not** rechunk or compute a checksum for you — you
-are fully responsible for the wire contract above, and any deviation either
-fails the upload outright or silently corrupts a later download.
+the complete file in memory. Use `upload_file_stream` only when you are
+ready to build every protobuf message yourself and match the wire contract
+above exactly; it is a low-level escape hatch that does **not** rechunk,
+cap a chunk's size, or compute a checksum for you. Since `rc.16`, getting
+the chunk *size* wrong here fails fast with `INVALID_ARGUMENT` rather than
+silently corrupting a later download — but a wrong `size_bytes` total, or a
+`checksum` that does not actually match the bytes (the server only checks
+its length, never its content), can still slip through as an
+upload that looks successful while carrying bad data. Prefer
+`upload_file_chunked` above unless you specifically need to hand-build the
+message stream.
 FR: Pour les gros downloads, preferez `download_file_stream` pour eviter de
 bufferiser tout le fichier en memoire. N utilisez `upload_file_stream` que
-pour des uploads vraiment en streaming (donnees qui ne tiennent jamais en
-memoire) ; c est une echappatoire bas niveau qui ne re-decoupe **ni** ne
-calcule de checksum pour vous — vous etes entierement responsable du contrat
-ci-dessus, et tout ecart fait soit echouer l upload directement, soit
-corrompt silencieusement un download ulterieur.
+quand vous etes pret a construire chaque message protobuf vous-meme et a
+respecter exactement le contrat sur le fil ci-dessus ; c est une
+echappatoire bas niveau qui ne re-decoupe **ni** ne plafonne la taille d un
+chunk **ni** ne calcule de checksum pour vous. Depuis `rc.16`, se tromper
+sur la *taille* du chunk ici echoue rapidement avec `INVALID_ARGUMENT`
+plutot que de corrompre silencieusement un download ulterieur — mais un
+`size_bytes` total incorrect, ou un `checksum` qui ne correspond pas
+reellement aux octets (le serveur ne verifie que sa longueur, jamais son
+contenu), peut encore passer au travers sous la forme d un upload qui
+semble reussi tout en portant des donnees erronees. Preferez
+`upload_file_chunked` ci-dessus sauf besoin specifique de construire le
+flux de messages a la main.
 
 ## Pagination
 
@@ -646,6 +885,42 @@ generent une cle par element, via `NodeInput::request_id` /
 `EdgeInput::request_id` — `None` pour generer automatiquement, `Some(..)`
 pour la controler vous-meme.
 
+EN: `create_document_with_request_id` is that sibling for `create_document`:
+`request_id` applies **only** to the document write (the `PutDoc` call) —
+the graph node binding, when `node_label`/`node_graph` are both `Some`,
+keeps generating its own key exactly as `create_document` already does.
+Unlike `create_document` (which takes an already-serialized
+`serde_json::Value`, to avoid a breaking signature change), this sibling is
+generic over any `Serialize` type, consistent with
+`put_document_with_request_id`/`put_node_with_request_id`/
+`add_edge_with_request_id`:
+
+```rust
+use serde_json::json;
+
+client
+    .create_document_with_request_id(
+        "tenant-1",
+        "products",
+        "sku-123",
+        &json!({"sku": "sku-123", "label": "Widget"}),
+        Some("product".to_string()),
+        Some("products".to_string()),
+        "reindex-job-42:sku-123",
+    )
+    .await?;
+```
+
+FR: `create_document_with_request_id` est ce sibling pour `create_document` :
+`request_id` s applique **uniquement** a l ecriture du document (l appel
+`PutDoc`) — le binding de node graph, quand `node_label`/`node_graph` sont
+tous deux `Some`, continue de generer sa propre cle exactement comme le
+fait deja `create_document`. Contrairement a `create_document` (qui prend
+un `serde_json::Value` deja serialise, pour eviter un changement de
+signature cassant), ce sibling est generique sur tout type `Serialize`,
+coherent avec `put_document_with_request_id`/`put_node_with_request_id`/
+`add_edge_with_request_id`.
+
 EN: Every listing method returns a named struct, never a bare tuple:
 [`Page<T>`](#pagination) (`items`, `next_cursor`) when there is no total to
 report, and [`DocumentPage<T>`](#pagination) (`items`, `next_cursor`,
@@ -739,6 +1014,228 @@ dans une signature de methode publique sont reexportes individuellement a
 la racine du crate a la place : `CollectionInfo`, `StatResponse`,
 `Neighbor`, `UploadRequest`, `DownloadResponse`. Dependez de ces
 reexports, pas de chemins qui plongent directement dans `pb`.
+
+## Parity with the TypeScript SDK
+
+EN: This SDK and the TypeScript SDK
+([`rociadb-core-sdk-ts`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-ts))
+cover the same 22 RPCs against the same server, and are maintained to the
+same standard: **every capability available in one is available in the
+other.** Neither imitates the other's syntax — this crate stays
+snake_case/`Result`-idiomatic Rust, the TypeScript package stays
+camelCase/exception-idiomatic TypeScript — but a piece of client code
+should always have a mechanical translation from one SDK to the other.
+Parity is about what you can *do*, not about matching method names
+character for character, and most names do translate mechanically
+(`put_nodes` ↔ `putNodes`, `get_outgoing_neighbor_nodes` ↔
+`getOutgoingNeighborNodes`, and so on). The handful of places where a name
+does **not** translate mechanically — where translating a call by ear
+lands you on the wrong method — are the naming table below.
+FR: Ce SDK et le SDK TypeScript
+([`rociadb-core-sdk-ts`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-ts))
+couvrent les memes 22 RPC face au meme serveur, et sont maintenus au meme
+niveau d exigence : **toute capacite disponible dans l un est disponible
+dans l autre.** Aucun n imite la syntaxe de l autre — cette crate reste du
+Rust idiomatique en snake_case/`Result`, le paquet TypeScript reste du
+TypeScript idiomatique en camelCase/exceptions — mais un morceau de code
+client doit toujours avoir une traduction mecanique d un SDK vers l autre.
+La parite porte sur ce que vous pouvez *faire*, pas sur la correspondance
+caractere pour caractere des noms de methode, et la plupart des noms se
+traduisent bien mecaniquement (`put_nodes` ↔ `putNodes`,
+`get_outgoing_neighbor_nodes` ↔ `getOutgoingNeighborNodes`, etc). Les
+quelques endroits ou un nom ne se traduit **pas** mecaniquement — ou
+traduire un appel a l oreille vous amene sur la mauvaise methode — sont
+dans le tableau de correspondance ci-dessous.
+
+| Capability / Capacite | Rust ([`rociadb-core-sdk-rust`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-rust)) | TypeScript ([`rociadb-core-sdk-ts`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-ts)) | Note |
+|---|---|---|---|
+| Assisted streaming upload — re-chunks to the 1 MiB wire contract, validates the total, caller supplies the checksum | `upload_file_chunked` | `uploadFileStream` | Names do **not** correspond — see below. |
+| Raw streaming upload — zero validation, caller builds every protobuf message | `upload_file_stream` | `uploadFileRaw` | Names do **not** correspond — the mirror image of the row above. |
+| Idempotency key scoped to a `create_document` call's document write only (the graph node binding keeps its own auto-generated key) | `create_document_with_request_id` — a sibling method, `request_id: impl Into<String>` | `createDocument(..., { requestId })` — an options-object field | Same capability, different shape: a sibling method vs. an options field, the established pattern on each side. |
+| Releasing the connection and the background token-refresh task | Drop the last live `RociaDbClient` clone | `client.close()` | No Rust method by design — see below. |
+| Lazy token invalidation, at the level of the background refresh task itself (not the `RociaDbClient`-level wrapper, which *does* translate mechanically: `invalidate_auth_token` ↔ `invalidateToken`) | `TokenManager::request_refresh` | `TokenManager.invalidate()` | Different verb chosen independently on each side for the same "mark it stale, wake the background task, do not block" idea. |
+| Standalone OAuth2 token fetch, usable outside of `TokenManager` | `auth::fetch_token` | `fetchOAuthToken` (exported from `auth.ts`, re-exported at the package root) | TypeScript needed a name that does not collide with the `fetch` Web API it wraps; Rust has no such collision. |
+| Discriminating why an `Err` happened | `RociaDbError` — a `match`-able enum: `Status { .. }` / `Connection { .. }` / `Auth { .. }` / `Encode { .. }` / `Decode { .. }` / `Validation(String)` | `RociaDbError.kind: RociaDbErrorKind`, one class with a `"status" \| "connection" \| "auth" \| "encode" \| "decode" \| "validation"` field | Different shape, not just a different name — see below. |
+| Escape hatch to the raw generated protobuf/gRPC types, to build a custom client against the same `.proto` | the `pb` module (`#[doc(hidden)] pub mod pb`; the handful of generated types that reach a public signature are re-exported individually at the crate root instead — `CollectionInfo`, `StatResponse`, `Neighbor`, `UploadRequest`, `DownloadResponse`) | the `rocia-db-sdk/proto` subpath export | Different mechanism, not just a different name: an in-crate module vs. a separate `package.json` `exports` entry. Neither is part of either package's semver contract. |
+
+EN: **The error-kind trap, spelled out:** both sides recognize the exact
+same six causes, in the same order, but represent the choice differently.
+Rust's `RociaDbError` is a real sum type — matching on it is exhaustive,
+and the compiler flags a missing arm. TypeScript keeps a single
+`RociaDbError` class (so an existing `instanceof RociaDbError` check never
+breaks) and puts the same six-way choice in a `kind` field instead —
+narrowing on `error.kind` gets you the same exhaustiveness check from
+`tsc`, just via a discriminated union instead of a variant match. Neither
+representation is "the same code translated"; each is the idiomatic way to
+express one closed set of causes in its own language.
+FR: **Le piege du `kind` d erreur, explicite :** les deux cotes
+reconnaissent exactement les six memes causes, dans le meme ordre, mais
+representent ce choix differemment. Le `RociaDbError` de Rust est un vrai
+sum type — le `match` dessus est exhaustif, et le compilateur signale un
+bras manquant. TypeScript garde une seule classe `RociaDbError` (pour
+qu un `instanceof RociaDbError` existant ne casse jamais) et met le meme
+choix a six branches dans un champ `kind` a la place — un narrowing sur
+`error.kind` donne la meme verification d exhaustivite de la part de
+`tsc`, juste via une union discriminee plutot qu un match de variante.
+Aucune des deux representations n est « le meme code traduit » ; chacune
+est la maniere idiomatique d exprimer un meme ensemble ferme de causes
+dans son propre langage.
+
+EN: **The upload naming trap, spelled out:** `upload_file_chunked` (Rust)
+and `uploadFileStream` (TypeScript) are the *same* capability — the middle
+tier that re-chunks and validates for you (see
+[Streaming an upload without buffering the whole file](#streaming-an-upload-without-buffering-the-whole-file)).
+`upload_file_stream` (Rust) and `uploadFileRaw` (TypeScript) are also the
+*same* capability — the raw, zero-validation escape hatch. `upload_file_stream`
+and `uploadFileStream` are **not** each other's counterpart, despite the
+near-identical name: the Rust one is the raw escape hatch, the TypeScript
+one is the validated middle tier. Porting upload code between the two SDKs
+by matching names alone silently swaps which tier you land on.
+FR: **Le piege de nommage de l upload, explicite :** `upload_file_chunked`
+(Rust) et `uploadFileStream` (TypeScript) sont la *meme* capacite — le
+palier intermediaire qui re-decoupe et valide pour vous (voir
+[Streaming an upload without buffering the whole file](#streaming-an-upload-without-buffering-the-whole-file)).
+`upload_file_stream` (Rust) et `uploadFileRaw` (TypeScript) sont aussi la
+*meme* capacite — l echappatoire brute sans validation.
+`upload_file_stream` et `uploadFileStream` ne sont **pas** l equivalent
+l un de l autre, malgre leur nom quasi identique : le Rust est
+l echappatoire brute, le TypeScript est le palier intermediaire valide.
+Porter du code d upload entre les deux SDKs en faisant correspondre les
+noms seuls vous fait silencieusement changer de palier.
+
+EN: **Why there is no Rust `close()`:** `RociaDbClient` is `Clone`, and
+every clone shares one underlying channel and one background refresh task
+by design (see [Authentication](#authentication)) — a `close(&self)` taking
+`&self` would tear the channel down out from under every other live clone,
+silently breaking that documented guarantee. The idiomatic Rust equivalent
+already exists and gives the identical guarantee: drop the last clone.
+`tonic::transport::Channel` is itself cheap to clone and shares one real
+connection underneath, so this is not a weaker substitute — it is the same
+guarantee, spelled the Rust way (RAII instead of an explicit call).
+FR: **Pourquoi il n y a pas de `close()` en Rust :** `RociaDbClient` est
+`Clone`, et chaque clone partage un meme channel sous-jacent et une meme
+tache de refresh en arriere-plan par construction (voir
+[Authentication](#authentication)) — un `close(&self)` prenant `&self`
+couperait le channel sous les pieds de tous les autres clones vivants,
+brisant silencieusement cette garantie deja documentee. L equivalent
+idiomatique Rust existe deja et donne la meme garantie : laisser tomber le
+dernier clone. `tonic::transport::Channel` est lui-meme peu couteux a
+cloner et partage une seule connexion reelle en dessous, donc ce n est pas
+un substitut plus faible — c est la meme garantie, exprimee a la maniere
+Rust (RAII plutot qu un appel explicite).
+
+EN: Two capabilities are intentionally kept on one side without a mirror on
+the other: `ApiKeyInterceptor` (Rust only — it validates an *incoming* API
+key, so it serves building a server or a test double, not talking to
+RociaDB, which puts it out of scope for a client SDK), and having both
+`RociaDbBuilder::build()` and a direct `RociaDbClient.connect()` entry
+point (TypeScript only — the builder there is a thin wrapper with no
+capability of its own, so duplicating a second entry point in Rust would
+add an API to maintain for zero new capability).
+FR: Deux capacites sont volontairement gardees d un seul cote sans miroir
+de l autre : `ApiKeyInterceptor` (Rust uniquement — il valide une cle API
+*entrante*, donc il sert a construire un serveur ou un test double, pas a
+parler a RociaDB, ce qui le met hors du perimetre d un SDK client), et le
+fait d avoir a la fois `RociaDbBuilder::build()` et un point d entree
+direct `RociaDbClient.connect()` (TypeScript uniquement — le builder y est
+un mince wrapper sans capacite propre, donc dupliquer un second point
+d entree en Rust ajouterait une API a maintenir pour zero capacite
+nouvelle).
+
+## Migrating to 0.6.0
+
+EN: 0.6.0 brings this SDK to full capability parity with the TypeScript SDK
+— see [Parity with the TypeScript SDK](#parity-with-the-typescript-sdk)
+above. **Every public method, type, and option that existed in 0.5.0 still
+exists, with the same signature and the same behavior — this release only
+adds.** Nothing is removed, nothing already-shipped becomes an error, and
+every new capability below is opt-in: existing call sites keep compiling
+and behaving exactly as before without touching them.
+FR: La 0.6.0 amene ce SDK a une parite de capacites complete avec le SDK
+TypeScript — voir
+[Parity with the TypeScript SDK](#parity-with-the-typescript-sdk)
+ci-dessus. **Chaque methode, type et option publics qui existaient en
+0.5.0 existent toujours, avec la meme signature et le meme comportement —
+cette version ne fait qu ajouter.** Rien n est retire, rien de deja livre
+ne devient une erreur, et chaque nouvelle capacite ci-dessous est
+opt-in : les points d appel existants continuent de compiler et de se
+comporter exactement comme avant sans y toucher.
+
+EN: **Documentation-only correction, no behavior change:** this README
+used to state that the server required upload chunks of exactly 1 MiB and
+that anything else silently corrupted a later download. That was accurate
+against every server up to `1.0.0-rc.15`, and is no longer accurate against
+`1.0.0-rc.16` and later — the server now reads a download back by
+`size_bytes`, not by an assumed chunk count. This SDK's own chunking never
+needed to change (it already always emitted exactly-1-MiB chunks, which
+remains correct and is still the most efficient choice, and is still
+required for correctness against a pre-`rc.16` server) — only the
+documentation explaining *why* was wrong and has been corrected. See
+[The upload wire contract](#the-upload-wire-contract) for the current
+rules and [Migrating to 0.3.0](#migrating-to-030) for the historical note.
+FR: **Correction de documentation uniquement, aucun changement de
+comportement :** ce README affirmait auparavant que le serveur exigeait
+des chunks d upload d exactement 1 MiB et que tout le reste corrompait
+silencieusement un download ulterieur. C etait exact face a tout serveur
+jusqu a `1.0.0-rc.15`, et ce ne l est plus face a `1.0.0-rc.16` et
+au-dela — le serveur relit desormais un download d apres `size_bytes`, pas
+d apres un nombre de chunks suppose. Le decoupage de ce SDK lui-meme n a
+jamais eu besoin de changer (il emettait deja toujours des chunks
+d exactement 1 MiB, ce qui reste correct et demeure le choix le plus
+efficace, et reste requis pour la correction face a un serveur pre-`rc.16`)
+— seule la documentation expliquant *pourquoi* etait fausse et a ete
+corrigee. Voir [The upload wire contract](#the-upload-wire-contract) pour
+les regles actuelles et [Migrating to 0.3.0](#migrating-to-030) pour la
+note historique.
+
+EN: New capabilities added in 0.6.0, each documented where linked:
+FR: Nouvelles capacites ajoutees en 0.6.0, chacune documentee la ou elle
+est liee :
+
+- `RociaDbBuilder::connect_timeout` and host-path validation on `build()`
+  — see [Host validation and connect timeout](#host-validation-and-connect-timeout).
+- `RociaDbClient::create_document_with_request_id` — see
+  [API Conventions](#api-conventions).
+- `RociaDbClient::invalidate_auth_token` (the lazy counterpart to the
+  existing `refresh_auth_token`) — see
+  [Two ways to recover from `UNAUTHENTICATED`](#two-ways-to-recover-from-unauthenticated).
+- `RociaDbClient::upload_file_chunked` and `FileStreamUploadOptions` — see
+  [Streaming an upload without buffering the whole file](#streaming-an-upload-without-buffering-the-whole-file).
+- `rust-version = "1.85"` declared in `Cargo.toml` — see
+  [Installation](#installation).
+
+EN: Also fixed in 0.6.0, purely as internal hardening — no call site needs
+to change for any of these:
+FR: Egalement corrige en 0.6.0, uniquement en tant que durcissement
+interne — aucun point d appel n a besoin de changer pour l un de ces
+points :
+
+- `RociaDbBuilder`'s `Debug` output no longer leaks `client_secret` in
+  plaintext (it now prints `"[redacted]"`).
+- `build()`'s debug-level log no longer includes `token_url`/`client_id`.
+- `ApiKeyInterceptor`'s key comparison is now constant-time instead of a
+  short-circuiting `==`, closing a timing side-channel.
+- **The one item here with an observable, non-cosmetic effect:** the
+  auto-generated `request_id` prefix for a document/node write is now
+  always `put_document:{collection}:<uuid>` / `put_node:<uuid>`, whichever
+  call path triggered it. Before 0.6.0, `create_document` and the batch
+  path behind `put_nodes` generated `upsert_document:...` /
+  `upsert_node:...` instead — an internal inconsistency (the single-item
+  `put_document`/`put_node` methods already used the `put_*` prefix) that
+  never affected correctness, but did mean the default idempotency-key
+  *format* depended on which method produced it. Nothing to do if you
+  never inspect or log auto-generated `request_id` values; expect the
+  `put_*` prefix uniformly from 0.6.0 onward if you do.
+
+EN: 0.6.0 is released together with, and version-numbered to match, the
+TypeScript SDK's own 0.6.0 — a byproduct of bringing the two to capability
+parity in the same pass, not a versioning scheme this changelog is
+committing either SDK to for future releases.
+FR: La 0.6.0 est publiee en meme temps que, et avec le meme numero de
+version que, la 0.6.0 du SDK TypeScript — un sous-produit du fait d avoir
+amene les deux a la parite de capacites dans la meme passe, pas un schema
+de versionnement que ce changelog engage pour les versions futures d un
+SDK ou de l autre.
 
 ## Migrating to 0.5.0
 
@@ -1002,6 +1499,33 @@ auditez vos points d appel en consequence :
    detect the corruption after the fact from the client side. If you were
    passing your own `checksum`, it must now be exactly 32 bytes or the call
    fails before any network request.
+
+   **This paragraph was accurate at the time it was written, against every
+   server version up to `1.0.0-rc.15`.** Server `1.0.0-rc.16` (see
+   [Migrating to 0.6.0](#migrating-to-060)) changed the download side of
+   this contract: it now reads back exactly `size_bytes` bytes instead of
+   guessing `ceil(size_bytes / 1 MiB)` chunk indexes, so an upload chunked
+   at anything other than exactly 1 MiB no longer corrupts a later
+   download. This SDK's behavior described above did not need to change —
+   it already always emitted exactly-1-MiB chunks — but the *reason* it
+   still does is now efficiency and pre-`rc.16` compatibility, not
+   correctness against the current server. See
+   [The upload wire contract](#the-upload-wire-contract) for the current
+   rules.
+
+   FR: **Ce paragraphe etait exact au moment ou il a ete ecrit, face a
+   toute version serveur jusqu a `1.0.0-rc.15`.** Le serveur `1.0.0-rc.16`
+   (voir [Migrating to 0.6.0](#migrating-to-060)) a change le cote download
+   de ce contrat : il relit desormais exactement `size_bytes` octets au
+   lieu de deviner des index de chunk via `ceil(size_bytes / 1 MiB)`, donc
+   un upload decoupe autrement qu en exactement 1 MiB ne corrompt plus un
+   download ulterieur. Le comportement de ce SDK decrit ci-dessus n a pas eu
+   besoin de changer — il emettait deja toujours des chunks d exactement 1
+   MiB — mais la *raison* pour laquelle il continue de le faire est
+   desormais l efficacite et la compatibilite avec un serveur pre-`rc.16`,
+   pas la correction face au serveur actuel. Voir
+   [The upload wire contract](#the-upload-wire-contract) pour les regles
+   actuelles.
 2. **`create_document` now rejects a partial graph binding instead of
    silently ignoring it.** Passing only one of `node_label`/`node_graph`
    (not both `Some` or both `None`) now returns an `Err` before any network

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tonic::metadata::{Ascii, MetadataKey, MetadataValue};
@@ -91,6 +91,20 @@ struct TokenManagerInner {
     /// tel que renvoye par l IdP. Pilote
     /// [`TokenManager::refresh_interval`].
     expires_in: AtomicU64,
+    /// EN: Wakes the background task spawned by [`TokenManager::spawn_refresh`]
+    /// as soon as possible, without the caller waiting for the network
+    /// round trip. See [`TokenManager::request_refresh`]. A `notify_one()`
+    /// call with no task currently waiting stores a permit that the next
+    /// `notified().await` consumes immediately, so a request issued between
+    /// two loop iterations of the background task is never lost.
+    /// FR: Reveille des que possible la tache en arriere-plan lancee par
+    /// [`TokenManager::spawn_refresh`], sans que l appelant attende le
+    /// round-trip reseau. Voir [`TokenManager::request_refresh`]. Un appel
+    /// `notify_one()` sans tache en attente stocke un permit que le
+    /// prochain `notified().await` consomme immediatement, donc une
+    /// demande emise entre deux iterations de boucle de la tache en
+    /// arriere-plan n est jamais perdue.
+    refresh_notify: Notify,
 }
 
 impl TokenManager {
@@ -130,6 +144,7 @@ impl TokenManager {
                 client_secret,
                 header_value,
                 expires_in,
+                refresh_notify: Notify::new(),
             }),
         })
     }
@@ -193,6 +208,31 @@ impl TokenManager {
         Ok(())
     }
 
+    /// EN: Request a token refresh without waiting for it.
+    ///
+    /// Unlike [`TokenManager::refresh_now`], this is **synchronous** and
+    /// returns immediately: it only wakes the background task started by
+    /// [`TokenManager::spawn_refresh`] (via a shared [`tokio::sync::Notify`])
+    /// so it refreshes at the next opportunity, without the caller paying
+    /// for the network round trip. If no background task is running (for
+    /// example, [`TokenManager::spawn_refresh`] was never called), this is
+    /// a harmless no-op — the notification is simply never consumed.
+    /// FR: Demande un refresh de token sans l attendre.
+    ///
+    /// Contrairement a [`TokenManager::refresh_now`], ceci est
+    /// **synchrone** et retourne immediatement : cela ne fait que reveiller
+    /// la tache en arriere-plan lancee par
+    /// [`TokenManager::spawn_refresh`] (via un [`tokio::sync::Notify`]
+    /// partage) pour qu elle rafraichisse a la prochaine occasion, sans que
+    /// l appelant paie le round-trip reseau. Si aucune tache en
+    /// arriere-plan ne tourne (par exemple,
+    /// [`TokenManager::spawn_refresh`] n a jamais ete appelee), ceci est un
+    /// no-op inoffensif — la notification n est simplement jamais
+    /// consommee.
+    pub fn request_refresh(&self) {
+        self.inner.refresh_notify.notify_one();
+    }
+
     /// EN: Spawn a background refresh task.
     /// FR: Lance une tache de refresh en background.
     ///
@@ -216,6 +256,22 @@ impl TokenManager {
                     _ = ticker.tick() => {
                         if let Err(err) = manager.refresh_now().await {
                             warn!(error = %err, "token refresh failed");
+                        }
+                    }
+                    // EN: Woken by `TokenManager::request_refresh` (and thus
+                    // `RociaDbClient::invalidate_auth_token`) so a caller can
+                    // signal "do not trust the cached token" without paying
+                    // for the refresh round trip itself — this background
+                    // task absorbs that latency instead.
+                    // FR: Reveillee par `TokenManager::request_refresh` (et
+                    // donc `RociaDbClient::invalidate_auth_token`) pour
+                    // qu un appelant puisse signaler "ne fais plus confiance
+                    // au token en cache" sans payer lui-meme le round-trip
+                    // de refresh — cette tache en arriere-plan absorbe cette
+                    // latence a sa place.
+                    _ = manager.inner.refresh_notify.notified() => {
+                        if let Err(err) = manager.refresh_now().await {
+                            warn!(error = %err, "requested token refresh failed");
                         }
                     }
                     _ = &mut shutdown_rx => {
@@ -347,7 +403,11 @@ impl Interceptor for ApiKeyInterceptor {
             .get(&self.header)
             .and_then(|value| value.to_str().ok())
         {
-            Some(provided) if provided == self.expected_key => Ok(request),
+            Some(provided)
+                if constant_time_eq(provided.as_bytes(), self.expected_key.as_bytes()) =>
+            {
+                Ok(request)
+            }
             Some(_) => {
                 warn!("invalid API key received");
                 Err(Status::unauthenticated("invalid API key"))
@@ -357,5 +417,236 @@ impl Interceptor for ApiKeyInterceptor {
                 Err(Status::unauthenticated("missing API key"))
             }
         }
+    }
+}
+
+/// EN: Constant-time byte comparison: always inspects every byte of the
+/// longer input before returning, instead of short-circuiting on the first
+/// mismatch (what `==` does on `&str`/`&[u8]`). Used by
+/// [`ApiKeyInterceptor::call`] so the time a comparison takes cannot leak,
+/// byte by byte, how much of the provided key matched the expected one.
+/// FR: Comparaison d octets en temps constant : inspecte toujours chaque
+/// octet de l entree la plus longue avant de retourner, plutot que de
+/// s arreter au premier octet different (ce que fait `==` sur
+/// `&str`/`&[u8]`). Utilisee par [`ApiKeyInterceptor::call`] pour que le
+/// temps pris par une comparaison ne puisse pas fuiter, octet par octet,
+/// la portion de la cle fournie qui correspondait a la cle attendue.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() != b.len()) as u8;
+    for i in 0..a.len().max(b.len()) {
+        let byte_a = a.get(i).copied().unwrap_or(0);
+        let byte_b = b.get(i).copied().unwrap_or(0);
+        diff |= byte_a ^ byte_b;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ApiKeyInterceptor, TokenManager, TokenManagerInner, TokenResponse, build_header,
+        constant_time_eq,
+    };
+    use std::sync::Arc;
+    use std::sync::RwLock;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use tonic::Request;
+    use tonic::metadata::{Ascii, MetadataValue};
+    use tonic::service::Interceptor;
+
+    // EN: `constant_time_eq` is the timing-safety fix for
+    // `ApiKeyInterceptor::call`, which used to compare the provided and
+    // expected keys with a plain `==` (short-circuits on the first
+    // mismatched byte, leaking timing information about how much of the
+    // key matched). These tests lock in that `constant_time_eq` is a
+    // *correct* equality check — the property `==` already had — while
+    // the always-scan-every-byte property it adds is a non-functional
+    // guarantee enforced by the implementation itself, not observable
+    // through a deterministic unit test.
+    // FR: `constant_time_eq` est le correctif de securite temporelle pour
+    // `ApiKeyInterceptor::call`, qui comparait auparavant la cle fournie
+    // et la cle attendue avec un simple `==` (s arrete au premier octet
+    // different, fuitant une information de timing sur la portion de la
+    // cle qui correspondait). Ces tests verrouillent le fait que
+    // `constant_time_eq` est une comparaison d egalite *correcte` — la
+    // propriete que `==` avait deja — tandis que la propriete "inspecte
+    // toujours chaque octet" qu elle ajoute est une garantie non
+    // fonctionnelle assuree par l implementation elle-meme, non
+    // observable via un test unitaire deterministe.
+
+    #[test]
+    fn constant_time_eq_accepts_identical_byte_strings() {
+        assert!(constant_time_eq(b"super-secret-key", b"super-secret-key"));
+    }
+
+    #[test]
+    fn constant_time_eq_accepts_two_empty_slices() {
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_a_single_differing_byte_at_any_position() {
+        let expected = b"abcdefgh";
+        for i in 0..expected.len() {
+            let mut candidate = expected.to_vec();
+            candidate[i] ^= 0xFF;
+            assert!(
+                !constant_time_eq(&candidate, expected),
+                "byte {i} differs from expected but was accepted as equal"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_lengths_even_when_one_is_a_prefix_of_the_other() {
+        assert!(!constant_time_eq(b"short", b"short-but-longer"));
+        assert!(!constant_time_eq(b"short-but-longer", b"short"));
+    }
+
+    fn request_with_api_key(key: Option<&str>) -> Request<()> {
+        let mut request = Request::new(());
+        if let Some(key) = key {
+            request.metadata_mut().insert(
+                "x-api-key",
+                key.parse::<MetadataValue<Ascii>>()
+                    .expect("test key must be a valid ascii metadata value"),
+            );
+        }
+        request
+    }
+
+    #[test]
+    fn api_key_interceptor_accepts_the_matching_key() {
+        let mut interceptor = ApiKeyInterceptor::new("expected-key".to_string());
+        let request = request_with_api_key(Some("expected-key"));
+        assert!(interceptor.call(request).is_ok());
+    }
+
+    #[test]
+    fn api_key_interceptor_rejects_a_mismatched_key() {
+        let mut interceptor = ApiKeyInterceptor::new("expected-key".to_string());
+        let request = request_with_api_key(Some("wrong-key"));
+        let status = interceptor
+            .call(request)
+            .expect_err("a mismatched key must be rejected");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn api_key_interceptor_rejects_a_missing_key() {
+        let mut interceptor = ApiKeyInterceptor::new("expected-key".to_string());
+        let request = request_with_api_key(None);
+        let status = interceptor
+            .call(request)
+            .expect_err("a missing key must be rejected");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    /// EN: Builds a `TokenManager` directly from `TokenManagerInner`
+    /// (rather than via `TokenManager::new`, which performs a real HTTP
+    /// round trip) so these tests stay fully offline. `token_url` is
+    /// deliberately not a well-formed URL: `reqwest` fails to parse it
+    /// and any `.send()` call resolves immediately with an error, without
+    /// ever opening a socket — so a test that calls `refresh_now` here
+    /// stays deterministic and network-free too.
+    /// FR: Construit un `TokenManager` directement a partir de
+    /// `TokenManagerInner` (plutot que via `TokenManager::new`, qui
+    /// effectue un veritable aller-retour HTTP) pour que ces tests restent
+    /// entierement hors-ligne. `token_url` n est deliberement pas une URL
+    /// bien formee : `reqwest` echoue a la parser et tout appel
+    /// `.send()` se resout immediatement avec une erreur, sans jamais
+    /// ouvrir de socket — donc un test qui appelle `refresh_now` ici
+    /// reste lui aussi deterministe et sans reseau.
+    fn offline_token_manager(header_value: MetadataValue<Ascii>) -> TokenManager {
+        TokenManager {
+            inner: Arc::new(TokenManagerInner {
+                http: reqwest::Client::new(),
+                token_url: "this is not a url".to_string(),
+                client_id: "unused-client-id".to_string(),
+                client_secret: "unused-client-secret".to_string(),
+                header_value: Arc::new(RwLock::new(header_value)),
+                expires_in: AtomicU64::new(600),
+                refresh_notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn sample_header(access_token: &str) -> MetadataValue<Ascii> {
+        build_header(&TokenResponse {
+            access_token: access_token.to_string(),
+            expires_in: 600,
+            token_type: "Bearer".to_string(),
+        })
+        .expect("a well-formed token response must build a valid header")
+    }
+
+    #[tokio::test]
+    async fn request_refresh_stores_a_wake_permit_consumed_by_the_next_notified_await() {
+        let manager = offline_token_manager(sample_header("token"));
+
+        // EN: `request_refresh` is a plain, non-async function — calling
+        // it with no `.await` is itself part of what this test locks in:
+        // unlike `refresh_now`, it must never make the caller wait for a
+        // network round trip.
+        // FR: `request_refresh` est une fonction simple, non-async —
+        // l appeler sans `.await` fait elle-meme partie de ce que ce test
+        // verrouille : contrairement a `refresh_now`, elle ne doit jamais
+        // faire attendre l appelant pour un round-trip reseau.
+        manager.request_refresh();
+
+        // EN: A bounded wait: if `request_refresh` regressed into a
+        // no-op, `notified()` would never resolve on its own and this
+        // test would hang instead of failing outright — the timeout turns
+        // that into a clean, fast failure.
+        // FR: Une attente bornee : si `request_refresh` regressait en
+        // no-op, `notified()` ne se resoudrait jamais seule et ce test
+        // bloquerait au lieu d echouer proprement — le timeout transforme
+        // cela en un echec net et rapide.
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            manager.inner.refresh_notify.notified(),
+        )
+        .await
+        .expect(
+            "request_refresh must store a wake permit that the next notified().await consumes \
+             immediately, without needing a concurrently waiting task",
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_now_never_replaces_a_still_valid_cached_token_when_the_refresh_fails() {
+        // EN: This is the Rust mirror of the TypeScript-side defect fix
+        // (`TokenManager.metadata()` used to drop a still-valid cached
+        // token when a refresh attempted within the skew margin failed).
+        // Rust's `refresh_now` already only overwrites `header_value` on
+        // success — this test locks that in so a future change cannot
+        // regress it silently.
+        // FR: C est le miroir cote Rust du correctif du defaut cote
+        // TypeScript (`TokenManager.metadata()` perdait un token encore
+        // valide en cache quand un refresh tente dans la marge de skew
+        // echouait). Le `refresh_now` de Rust n ecrase deja `header_value`
+        // qu en cas de succes — ce test verrouille ce comportement pour
+        // qu un changement futur ne puisse pas le faire regresser
+        // silencieusement.
+        let original_header = sample_header("still-valid-token");
+        let manager = offline_token_manager(original_header.clone());
+
+        let result = manager.refresh_now().await;
+        assert!(
+            result.is_err(),
+            "a malformed token_url must make refresh_now fail"
+        );
+
+        let current = manager
+            .inner
+            .header_value
+            .read()
+            .expect("header lock must not be poisoned");
+        assert_eq!(
+            *current, original_header,
+            "a failed refresh must never replace a still-cached, still-valid header value"
+        );
     }
 }

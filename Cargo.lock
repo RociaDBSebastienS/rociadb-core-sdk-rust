@@ -1185,9 +1185,10 @@ dependencies = [
 
 [[package]]
 name = "rocia-db-sdk"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "futures",
+ "http",
  "pbjson-types",
  "prost",
  "prost-build",

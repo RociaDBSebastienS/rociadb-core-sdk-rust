@@ -44,7 +44,7 @@ pub mod pb;
 mod tenant;
 
 pub use error::{Result, RociaDbError};
-pub use file::FileUploadOptions;
+pub use file::{FileStreamUploadOptions, FileUploadOptions};
 pub use graph::{NeighborNode, NeighborPage};
 pub use pb::upstream::v1::{
     CollectionInfo, DownloadResponse, Neighbor, StatResponse, UploadRequest,
@@ -66,6 +66,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::codegen::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tracing::{debug, error, info, warn};
@@ -80,8 +81,18 @@ const DEFAULT_PAGE_SIZE: u32 = 20;
 const AUTH_TOKEN_URL_ENV: &str = "AUTH_TOKEN_URL";
 const AUTH_CLIENT_ID_ENV: &str = "AUTH_CLIENT_ID";
 const AUTH_CLIENT_SECRET_ENV: &str = "AUTH_CLIENT_SECRET";
+/// EN: Connect timeout applied in [`RociaDbBuilder::build`] when
+/// [`RociaDbBuilder::connect_timeout`] was never called. Identical to the
+/// TypeScript SDK's default `connectTimeoutMs` (10_000 ms) so a host that
+/// never answers cannot hang either SDK's `build()`/`connect()` forever.
+/// FR: Delai de connexion applique dans [`RociaDbBuilder::build`] quand
+/// [`RociaDbBuilder::connect_timeout`] n a jamais ete appelee. Identique au
+/// `connectTimeoutMs` par defaut du SDK TypeScript (10_000 ms), pour qu un
+/// host qui ne repond jamais ne puisse bloquer indefiniment ni l un ni
+/// l autre `build()`/`connect()`.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum BuilderAuthConfig {
     Enabled {
         token_url: Option<String>,
@@ -91,12 +102,38 @@ enum BuilderAuthConfig {
     Disabled,
 }
 
+// EN: Manual `Debug` impl instead of `#[derive(Debug)]`: a derived impl
+// would print `client_secret` in clear text, so any `format!("{:?}", ..)`
+// or debug-level log of a `RociaDbBuilder` would leak the OAuth2 secret.
+// FR: Impl `Debug` manuelle plutot que `#[derive(Debug)]` : une impl
+// derivee afficherait `client_secret` en clair, donc tout
+// `format!("{:?}", ..)` ou log de niveau debug d un `RociaDbBuilder`
+// fuiterait le secret OAuth2.
+impl std::fmt::Debug for BuilderAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Enabled {
+                token_url,
+                client_id,
+                client_secret: _,
+            } => f
+                .debug_struct("Enabled")
+                .field("token_url", token_url)
+                .field("client_id", client_id)
+                .field("client_secret", &"[redacted]")
+                .finish(),
+            Self::Disabled => f.write_str("Disabled"),
+        }
+    }
+}
+
 /// EN: Builder for RociaDbClient.
 /// FR: Builder pour RociaDbClient.
 #[derive(Debug)]
 pub struct RociaDbBuilder {
     host: Option<String>,
     auth: BuilderAuthConfig,
+    connect_timeout: Option<Duration>,
 }
 
 /// EN: gRPC client for document, graph, file, and tenant services.
@@ -339,15 +376,19 @@ pub struct NodeInput {
     pub node_id: String,
     pub value: Value,
     /// EN: Idempotency key for this item's `PutNode` call. When `None`, one
-    /// is generated automatically (same `upsert_node:<uuid>` format as
-    /// before this type existed). Provide it explicitly — and reuse the
+    /// is generated automatically (`put_node:<uuid>` — the same prefix
+    /// [`RociaDbClient::put_node`] uses for a single-item write, so a
+    /// `PutNode` call always carries the same default prefix regardless of
+    /// which path produced it). Provide it explicitly — and reuse the
     /// same value on a retry — so a batch replayed after a timeout resumes
     /// safely: the server deduplicates on `(tenant, operation,
     /// request_id)`, so a repeated `request_id` is recognized as the same
     /// write rather than a new one.
     /// FR: Cle d idempotence pour l appel `PutNode` de cet item. Quand elle
-    /// vaut `None`, une cle est generee automatiquement (meme format
-    /// `upsert_node:<uuid>` qu avant l existence de ce type).
+    /// vaut `None`, une cle est generee automatiquement (`put_node:<uuid>`
+    /// — le meme prefixe qu utilise [`RociaDbClient::put_node`] pour une
+    /// ecriture unitaire, pour qu un appel `PutNode` porte toujours le meme
+    /// prefixe par defaut quel que soit le chemin qui l a produit).
     /// Fournissez-la explicitement — et reutilisez la meme valeur lors d un
     /// rejeu — pour qu un batch rejoue apres un timeout reprenne en toute
     /// securite : le serveur deduplique sur `(tenant, operation,
@@ -388,7 +429,10 @@ pub struct EdgeInput {
 /// client: item order is preserved (`nodes` is consumed via `into_iter` in
 /// the order given), duplicate `node_id`s are not merged (each `NodeInput`
 /// becomes exactly one `PutNodeRequest`), and `request_id` is passed
-/// through unchanged or defaulted to `upsert_node:<uuid>` when absent.
+/// through unchanged or defaulted to `put_node:<uuid>` when absent — the
+/// same default prefix [`RociaDbClient::put_node`] uses for a single-item
+/// write, so every `PutNode` call defaults consistently regardless of
+/// whether it went through the batch or single-item path.
 /// FR: Construit le batch `PutNodeRequest` ordonne pour
 /// [`RociaDbClient::put_nodes`]. Extraite en fonction pure, sans reseau —
 /// comme [`crate::file::chunk_upload_requests`] pour les uploads — pour que
@@ -397,7 +441,10 @@ pub struct EdgeInput {
 /// `into_iter` dans l ordre fourni), les `node_id` dupliques ne sont pas
 /// fusionnes (chaque `NodeInput` devient exactement un `PutNodeRequest`),
 /// et `request_id` est transmis tel quel ou vaut par defaut
-/// `upsert_node:<uuid>` quand il est absent.
+/// `put_node:<uuid>` quand il est absent — le meme prefixe par defaut
+/// qu utilise [`RociaDbClient::put_node`] pour une ecriture unitaire, pour
+/// que tout appel `PutNode` ait un defaut coherent, qu il passe par le
+/// batch ou par le chemin unitaire.
 fn build_put_node_requests(
     tenant_id: &str,
     graph_name: &str,
@@ -414,7 +461,7 @@ fn build_put_node_requests(
                 json,
                 request_id: node
                     .request_id
-                    .unwrap_or_else(|| format!("upsert_node:{}", Uuid::new_v4())),
+                    .unwrap_or_else(|| format!("put_node:{}", Uuid::new_v4())),
             })
         })
         .collect()
@@ -464,6 +511,85 @@ fn build_add_edge_requests(
         .collect()
 }
 
+/// EN: Default idempotency key for the `PutDoc` write issued by
+/// [`RociaDbClient::create_document`] when the caller does not use
+/// [`RociaDbClient::create_document_with_request_id`] directly. Pulled out
+/// as a pure, network-free function — the same reason
+/// [`build_put_node_requests`] and [`build_add_edge_requests`] exist — so
+/// the exact default prefix (`put_document:{collection}:<uuid>`, matching
+/// [`RociaDbClient::put_document`]'s own default; see the request_id-prefix
+/// consistency fix on [`build_put_node_requests`]) is unit-testable without
+/// a live client or a network call.
+/// FR: Cle d idempotence par defaut pour l ecriture `PutDoc` emise par
+/// [`RociaDbClient::create_document`] quand l appelant n utilise pas
+/// directement [`RociaDbClient::create_document_with_request_id`]. Extraite
+/// en fonction pure, sans reseau — pour la meme raison que
+/// [`build_put_node_requests`] et [`build_add_edge_requests`] existent —
+/// pour que le prefixe par defaut exact (`put_document:{collection}:<uuid>`,
+/// coherent avec le defaut de [`RociaDbClient::put_document`] ; voir le
+/// correctif de coherence des prefixes de request_id sur
+/// [`build_put_node_requests`]) soit testable unitairement sans client reel
+/// ni appel reseau.
+fn default_document_request_id(collection_name: &str) -> String {
+    format!("put_document:{}:{}", collection_name, Uuid::new_v4())
+}
+
+/// EN: Reject a `host` URL whose path is neither empty nor `"/"`, before any
+/// connection attempt. Mirrors the TypeScript SDK's `endpointFromHost`,
+/// which rejects on `url.pathname !== "/"`: a mistyped host carrying a
+/// leftover path (for example `http://127.0.0.1:50051/v1` pasted from
+/// somewhere else) would otherwise be silently accepted by tonic, which
+/// simply ignores the path component when dialing.
+///
+/// `http::Uri::path()` already returns `"/"` for a URI with no explicit
+/// path component (verified against `http` 1.x), so this rejects strictly
+/// more than "path is exactly absent" — matching what `URL::pathname`
+/// reports on the TypeScript side.
+/// FR: Rejette un `host` dont le chemin d URL n est ni vide ni `"/"`, avant
+/// toute tentative de connexion. Reproduit `endpointFromHost` du SDK
+/// TypeScript, qui rejette sur `url.pathname !== "/"` : un host mal saisi
+/// portant un chemin residuel (par exemple `http://127.0.0.1:50051/v1`
+/// colle depuis ailleurs) serait sinon silencieusement accepte par tonic,
+/// qui ignore simplement la composante chemin lors de la connexion.
+///
+/// `http::Uri::path()` renvoie deja `"/"` pour une URI sans composante
+/// chemin explicite (verifie avec `http` 1.x), donc ceci rejette strictement
+/// plus que "le chemin est totalement absent" — coherent avec ce que
+/// `URL::pathname` rapporte cote TypeScript.
+fn validate_host_path(host: &str) -> Result<()> {
+    let uri: http::Uri = host.parse().connection_context("invalid upstream host")?;
+    let path = uri.path();
+    if !path.is_empty() && path != "/" {
+        return Err(RociaDbError::connection(format!(
+            "RociaDB host must contain only a hostname and port, got path {path:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// EN: Resolve the connect timeout [`RociaDbBuilder::build`] applies:
+/// `explicit` when [`RociaDbBuilder::connect_timeout`] was called, or
+/// [`DEFAULT_CONNECT_TIMEOUT`] otherwise — rejecting a zero timeout either
+/// way. Extracted as a pure, network-free function (mirrors
+/// [`validate_host_path`]) so both the default value and the zero-timeout
+/// rejection are unit-testable without ever dialing an upstream.
+/// FR: Resout le delai de connexion applique par [`RociaDbBuilder::build`] :
+/// `explicit` quand [`RociaDbBuilder::connect_timeout`] a ete appelee, ou
+/// [`DEFAULT_CONNECT_TIMEOUT`] sinon — en rejetant un delai nul dans les
+/// deux cas. Extraite en fonction pure, sans reseau (miroir de
+/// [`validate_host_path`]) pour que la valeur par defaut et le rejet du
+/// delai nul soient toutes deux testables unitairement sans jamais
+/// composer un upstream.
+fn resolve_connect_timeout(explicit: Option<Duration>) -> Result<Duration> {
+    let connect_timeout = explicit.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+    if connect_timeout.is_zero() {
+        return Err(RociaDbError::validation(
+            "connect timeout must be greater than zero",
+        ));
+    }
+    Ok(connect_timeout)
+}
+
 impl Default for RociaDbBuilder {
     fn default() -> Self {
         Self {
@@ -473,6 +599,7 @@ impl Default for RociaDbBuilder {
                 client_id: None,
                 client_secret: None,
             },
+            connect_timeout: None,
         }
     }
 }
@@ -543,6 +670,37 @@ impl RociaDbBuilder {
         self
     }
 
+    /// EN: Set the deadline used while connecting to the upstream host.
+    ///
+    /// The value is stored as-is here (no validation), the same way
+    /// [`RociaDbBuilder::host`] and
+    /// [`RociaDbBuilder::auth_client_credentials`] never validate before
+    /// [`RociaDbBuilder::build`] — validation (rejecting a zero timeout)
+    /// happens there instead. When this is never called, `build()` applies
+    /// a 10-second default unconditionally: without any timeout at all,
+    /// `.connect().await` could hang forever against a host with slow
+    /// DNS/TCP, which is a robustness gap rather than a mere convenience.
+    /// FR: Definit le delai applique pendant la connexion au host upstream.
+    ///
+    /// La valeur est stockee telle quelle ici (aucune validation), comme
+    /// [`RociaDbBuilder::host`] et
+    /// [`RociaDbBuilder::auth_client_credentials`] qui ne valident jamais
+    /// avant [`RociaDbBuilder::build`] — la validation (rejet d un delai
+    /// nul) s y produit a la place. Quand ceci n est jamais appele,
+    /// `build()` applique un defaut de 10 secondes de facon
+    /// inconditionnelle : sans aucun delai, `.connect().await` pourrait
+    /// bloquer indefiniment face a un host avec un DNS/TCP lent, ce qui est
+    /// une vraie lacune de robustesse plutot qu un simple confort.
+    ///
+    /// EN: Returns:
+    /// - Mutable builder reference.
+    /// FR: Returns:
+    /// - Reference mutable du builder.
+    pub fn connect_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
     /// EN: Build a client connected to the upstream.
     ///
     /// EN: When auth is enabled, this fetches the first token and starts a
@@ -571,10 +729,13 @@ impl RociaDbBuilder {
             .as_ref()
             .ok_or_else(|| RociaDbError::connection("missing upstream host"))?;
         info!(host = %host, "building rocia db client");
+        validate_host_path(host)?;
+        let connect_timeout = resolve_connect_timeout(self.connect_timeout)?;
         let endpoint = Endpoint::from_shared(host.clone())
             .connection_context("invalid upstream host")?
             .tls_config(ClientTlsConfig::new().with_native_roots())
-            .connection_context("failed to configure TLS")?;
+            .connection_context("failed to configure TLS")?
+            .connect_timeout(connect_timeout);
         let channel = endpoint
             .connect()
             .await
@@ -610,12 +771,15 @@ impl RociaDbBuilder {
                         )
                     })?;
 
-                debug!(
-                    host = %host,
-                    token_url = %token_url,
-                    client_id = %client_id,
-                    "initializing upstream token manager"
-                );
+                // EN: `token_url`/`client_id` are deliberately not logged
+                // here: they expose the auth infrastructure (IdP endpoint,
+                // OAuth2 client identity) in any log pipeline configured at
+                // debug level.
+                // FR: `token_url`/`client_id` ne sont volontairement pas
+                // journalises ici : ils exposent l infrastructure d auth
+                // (endpoint de l IdP, identite du client OAuth2) dans tout
+                // pipeline de logs configure au niveau debug.
+                debug!(host = %host, "initializing upstream token manager");
                 let token_manager =
                     TokenManager::new(reqwest::Client::new(), token_url, client_id, client_secret)
                         .await
@@ -684,6 +848,39 @@ impl RociaDbClient {
             None => Ok(()),
         }
     }
+
+    /// EN: Signal that the cached upstream auth token should no longer be
+    /// trusted, without waiting for a fresh one.
+    ///
+    /// This is the lazy counterpart to
+    /// [`RociaDbClient::refresh_auth_token`]: it is **synchronous** and
+    /// returns immediately — it only wakes the background refresh task
+    /// (started by [`RociaDbBuilder::build`]) so it refreshes at the next
+    /// opportunity, instead of making the caller pay for the network round
+    /// trip. Prefer this over [`RociaDbClient::refresh_auth_token`] when
+    /// you just want to mark the token stale (for example, from a
+    /// fire-and-forget error handler) rather than block until a new one is
+    /// in hand before retrying. A no-op when the client was built with
+    /// [`RociaDbBuilder::disable_auth`].
+    /// FR: Signale que le token d auth upstream en cache ne doit plus etre
+    /// considere fiable, sans attendre qu un nouveau soit disponible.
+    ///
+    /// C est le pendant paresseux de
+    /// [`RociaDbClient::refresh_auth_token`] : **synchrone**, il retourne
+    /// immediatement — il se contente de reveiller la tache de refresh en
+    /// arriere-plan (demarree par [`RociaDbBuilder::build`]) pour qu elle
+    /// rafraichisse a la prochaine occasion, plutot que de faire payer a
+    /// l appelant le round-trip reseau. Preferez ceci a
+    /// [`RociaDbClient::refresh_auth_token`] quand vous voulez juste
+    /// marquer le token comme perime (par exemple depuis un gestionnaire
+    /// d erreur fire-and-forget) plutot que bloquer jusqu a en avoir un
+    /// nouveau en main avant de reessayer. Ne fait rien quand le client a
+    /// ete construit avec [`RociaDbBuilder::disable_auth`].
+    pub fn invalidate_auth_token(&self) {
+        if let Some(manager) = &self.token_manager {
+            manager.request_refresh();
+        }
+    }
 }
 
 impl RociaDbClient {
@@ -743,6 +940,58 @@ impl RociaDbClient {
         node_label: Option<String>,
         node_graph: Option<String>,
     ) -> Result<()> {
+        let request_id = default_document_request_id(collection_name);
+        self.create_document_with_request_id(
+            tenant_id,
+            collection_name,
+            document_id,
+            &value,
+            node_label,
+            node_graph,
+            request_id,
+        )
+        .await
+    }
+
+    /// EN: Same as [`RociaDbClient::create_document`], with a
+    /// caller-provided idempotency key for the document write (the
+    /// `PutDoc` call only — the graph node binding, when requested, keeps
+    /// generating its own key, exactly as it already does in
+    /// [`RociaDbClient::create_document`]). Reuse the same `request_id` on
+    /// a retry so the server recognizes a repeated write instead of
+    /// applying it twice.
+    ///
+    /// Unlike [`RociaDbClient::create_document`], `value` is generic over
+    /// any `Serialize` type — consistent with
+    /// [`RociaDbClient::put_document_with_request_id`],
+    /// [`RociaDbClient::put_node_with_request_id`], and
+    /// [`RociaDbClient::add_edge_with_request_id`] — rather than requiring
+    /// the caller to pre-serialize into `serde_json::Value` first.
+    /// FR: Identique a [`RociaDbClient::create_document`], avec une cle
+    /// d idempotence fournie par l appelant pour l ecriture du document
+    /// (l appel `PutDoc` uniquement — le binding de node graph, si demande,
+    /// continue de generer sa propre cle, exactement comme le fait deja
+    /// [`RociaDbClient::create_document`]). Reutilisez le meme
+    /// `request_id` lors d un rejeu pour que le serveur reconnaisse une
+    /// ecriture repetee plutot que de l appliquer deux fois.
+    ///
+    /// Contrairement a [`RociaDbClient::create_document`], `value` est
+    /// generique sur tout type `Serialize` — coherent avec
+    /// [`RociaDbClient::put_document_with_request_id`],
+    /// [`RociaDbClient::put_node_with_request_id`], et
+    /// [`RociaDbClient::add_edge_with_request_id`] — plutot que d exiger
+    /// que l appelant pre-serialise d abord vers `serde_json::Value`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_document_with_request_id<T: Serialize + ?Sized>(
+        &self,
+        tenant_id: &str,
+        collection_name: &str,
+        document_id: &str,
+        value: &T,
+        node_label: Option<String>,
+        node_graph: Option<String>,
+        request_id: impl Into<String>,
+    ) -> Result<()> {
         validate_node_binding(&node_label, &node_graph)?;
         debug!(
             tenant_id = tenant_id,
@@ -751,7 +1000,7 @@ impl RociaDbClient {
             has_node_binding = node_label.is_some() && node_graph.is_some(),
             "upserting document"
         );
-        let json = serde_json::to_vec(&value)
+        let json = serde_json::to_vec(value)
             .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
@@ -767,7 +1016,7 @@ impl RociaDbClient {
             collection: collection_name.to_string(),
             id: document_id.to_string(),
             json,
-            request_id: format!("upsert_document:{}:{}", collection_name, Uuid::new_v4()),
+            request_id: request_id.into(),
         };
         let mut upstream_document = self.upstream_document.clone();
         upstream_document
@@ -819,7 +1068,7 @@ impl RociaDbClient {
                 graph: graph.clone(),
                 node_id: format!("{}:{}", label, document_id),
                 json,
-                request_id: format!("upsert_node:{}", Uuid::new_v4()),
+                request_id: format!("put_node:{}", Uuid::new_v4()),
             };
             let mut upstream_graph = self.upstream_graph.clone();
             upstream_graph
@@ -1577,10 +1826,53 @@ impl RociaDbClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentPage, EdgeInput, NodeInput, RociaDbClient, build_add_edge_requests,
-        build_put_node_requests, validate_node_binding,
+        BearerInterceptor, DEFAULT_CONNECT_TIMEOUT, DocumentPage, DocumentServiceClient, EdgeInput,
+        FileServiceClient, GraphServiceClient, NodeInput, RociaDbBuilder, RociaDbClient,
+        TenantServiceClient, build_add_edge_requests, build_put_node_requests,
+        default_document_request_id, resolve_connect_timeout, validate_host_path,
+        validate_node_binding,
     };
-    use crate::RociaDbError;
+    use crate::{FileStreamUploadOptions, RociaDbError};
+    use futures::stream;
+    use std::time::Duration;
+    use tonic::transport::Endpoint;
+
+    /// EN: A `RociaDbClient` wired to a channel that never actually dials
+    /// (`Endpoint::connect_lazy` performs no I/O — it only builds a
+    /// connector that would try to connect on the *first real RPC*). Used
+    /// to test the client-side gating that must reject a request before
+    /// ever reaching the network — if such a test regressed and the
+    /// gating ran too late, it would hang or fail against the
+    /// unreachable `127.0.0.1:1` host instead of returning promptly.
+    /// FR: Un `RociaDbClient` cable sur un canal qui ne compose jamais
+    /// reellement (`Endpoint::connect_lazy` n effectue aucune E/S — il ne
+    /// fait que construire un connecteur qui tenterait de se connecter au
+    /// *premier RPC reel*). Utilise pour tester les gardes-fous cote
+    /// client qui doivent rejeter une requete avant d atteindre le
+    /// reseau — si un tel test regressait et que la garde s executait
+    /// trop tard, il bloquerait ou echouerait contre le host injoignable
+    /// `127.0.0.1:1` au lieu de retourner promptement.
+    fn lazy_test_client() -> RociaDbClient {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let interceptor = BearerInterceptor::disabled();
+        RociaDbClient {
+            upstream_document: DocumentServiceClient::with_interceptor(
+                channel.clone(),
+                interceptor.clone(),
+            ),
+            upstream_graph: GraphServiceClient::with_interceptor(
+                channel.clone(),
+                interceptor.clone(),
+            ),
+            upstream_file: FileServiceClient::with_interceptor(
+                channel.clone(),
+                interceptor.clone(),
+            ),
+            upstream_tenant: TenantServiceClient::with_interceptor(channel, interceptor),
+            token_manager: None,
+            _token_refresh_guard: None,
+        }
+    }
 
     #[test]
     fn node_binding_accepts_both_absent() {
@@ -1753,15 +2045,21 @@ mod tests {
     }
 
     #[test]
-    fn put_node_requests_default_request_id_keeps_the_pre_0_5_0_prefix() {
-        // EN: This is the idempotency-hole fix: before `NodeInput` existed,
-        // an absent id was generated as `upsert_node:<uuid>`. A caller
-        // relying on that exact prefix (for log filtering, for example)
-        // must see it unchanged.
-        // FR: C est le correctif du trou d idempotence : avant l existence
-        // de `NodeInput`, un id absent etait genere en
-        // `upsert_node:<uuid>`. Un appelant qui se fie a ce prefixe exact
-        // (pour du filtrage de logs, par exemple) doit le voir inchange.
+    fn put_node_requests_default_request_id_matches_the_single_item_put_node_prefix() {
+        // EN: `put_nodes` (batch) and `put_node` (single-item) both issue
+        // `PutNode` calls, so an absent id must default to the exact same
+        // prefix on both paths: `put_node:<uuid>`. This used to diverge —
+        // the batch path defaulted to `upsert_node:<uuid>` instead — which
+        // meant the same operation had two different default idempotency
+        // key shapes depending only on which method the caller happened to
+        // use.
+        // FR: `put_nodes` (batch) et `put_node` (unitaire) emettent tous
+        // deux des appels `PutNode`, donc un id absent doit avoir par
+        // defaut exactement le meme prefixe sur les deux chemins :
+        // `put_node:<uuid>`. Cela divergeait auparavant — le chemin batch
+        // avait pour defaut `upsert_node:<uuid>` — ce qui faisait que la
+        // meme operation avait deux formes de cle d idempotence par defaut
+        // differentes selon la seule methode utilisee par l appelant.
         let nodes = vec![
             NodeInput {
                 node_id: "product:1".to_string(),
@@ -1779,8 +2077,8 @@ mod tests {
         for request in &requests {
             let uuid_part = request
                 .request_id
-                .strip_prefix("upsert_node:")
-                .expect("default request_id must keep the upsert_node: prefix");
+                .strip_prefix("put_node:")
+                .expect("default request_id must use the put_node: prefix");
             uuid::Uuid::parse_str(uuid_part).expect("suffix after the prefix must be a uuid");
         }
         assert_ne!(
@@ -1950,5 +2248,259 @@ mod tests {
             total_count: 2,
         };
         assert_ne!(page, different);
+    }
+
+    // EN: `validate_host_path` mirrors the TypeScript SDK's
+    // `endpointFromHost` pathname check (see the function's own doc
+    // comment). A host URL with a leftover path component would
+    // otherwise be silently accepted by tonic, which simply ignores it
+    // when dialing.
+    // FR: `validate_host_path` reproduit le controle de pathname de
+    // `endpointFromHost` cote TypeScript (voir le doc comment de la
+    // fonction). Un host avec un chemin residuel serait sinon
+    // silencieusement accepte par tonic, qui l ignore lors de la
+    // connexion.
+
+    #[test]
+    fn host_path_validation_accepts_a_host_with_no_path_component() {
+        validate_host_path("http://127.0.0.1:50051").expect("an absent path must be accepted");
+    }
+
+    #[test]
+    fn host_path_validation_accepts_a_bare_root_path() {
+        validate_host_path("http://127.0.0.1:50051/").expect("a bare \"/\" must be accepted");
+    }
+
+    #[test]
+    fn host_path_validation_rejects_a_host_carrying_a_leftover_path() {
+        let error = validate_host_path("http://127.0.0.1:50051/v1")
+            .expect_err("a host with a non-root path must be rejected");
+        assert!(matches!(error, RociaDbError::Connection { .. }));
+        assert!(
+            error.to_string().contains("/v1"),
+            "the error should name the offending path, got: {error}"
+        );
+    }
+
+    // EN: `resolve_connect_timeout` is the pure core behind
+    // `RociaDbBuilder::build`'s connect-timeout handling: no explicit
+    // value falls back to `DEFAULT_CONNECT_TIMEOUT`, and a zero timeout
+    // is always rejected regardless of where it came from.
+    // FR: `resolve_connect_timeout` est le coeur pur derriere la gestion
+    // du delai de connexion de `RociaDbBuilder::build` : aucune valeur
+    // explicite retombe sur `DEFAULT_CONNECT_TIMEOUT`, et un delai nul
+    // est toujours rejete quelle que soit son origine.
+
+    #[test]
+    fn default_connect_timeout_matches_the_typescript_sdk_default() {
+        // EN: This is the exact parity value from the cahier des charges:
+        // the TypeScript SDK's `connectTimeoutMs` default is 10_000 ms.
+        // FR: C est la valeur de parite exacte du cahier des charges : le
+        // defaut `connectTimeoutMs` du SDK TypeScript est 10_000 ms.
+        assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn resolve_connect_timeout_falls_back_to_the_default_when_unset() {
+        let timeout =
+            resolve_connect_timeout(None).expect("the default timeout must always be accepted");
+        assert_eq!(timeout, DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn resolve_connect_timeout_accepts_a_caller_supplied_positive_value() {
+        let timeout = resolve_connect_timeout(Some(Duration::from_secs(3)))
+            .expect("a positive explicit timeout must be accepted");
+        assert_eq!(timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn resolve_connect_timeout_rejects_zero() {
+        let error = resolve_connect_timeout(Some(Duration::ZERO))
+            .expect_err("a zero connect timeout must be rejected");
+        assert!(matches!(error, RociaDbError::Validation(_)));
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn builder_connect_timeout_setter_stores_the_value_unvalidated() {
+        // EN: Mirrors `RociaDbBuilder::host` / `auth_client_credentials`:
+        // the setter never validates, only `build()` does (via
+        // `resolve_connect_timeout`, tested above) — so even a
+        // nonsensical zero duration must be stored as-is here.
+        // FR: Reproduit `RociaDbBuilder::host` / `auth_client_credentials` :
+        // le setter ne valide jamais, seul `build()` le fait (via
+        // `resolve_connect_timeout`, teste ci-dessus) — donc meme une
+        // duree nulle absurde doit etre stockee telle quelle ici.
+        let mut builder = RociaDbBuilder::new();
+        builder.connect_timeout(Duration::ZERO);
+        assert_eq!(builder.connect_timeout, Some(Duration::ZERO));
+
+        let mut builder = RociaDbBuilder::new();
+        builder.connect_timeout(Duration::from_secs(42));
+        assert_eq!(builder.connect_timeout, Some(Duration::from_secs(42)));
+    }
+
+    #[tokio::test]
+    async fn build_rejects_a_zero_connect_timeout_before_any_network_call() {
+        // EN: `validate_host_path` and the connect-timeout check both run
+        // before `Endpoint::connect()`, so this must return promptly with
+        // `Validation` instead of hanging or failing against the
+        // (deliberately unreachable) host.
+        // FR: `validate_host_path` et le controle du delai de connexion
+        // s executent tous deux avant `Endpoint::connect()`, donc ceci
+        // doit retourner promptement avec `Validation` plutot que de
+        // bloquer ou echouer contre le host (deliberement injoignable).
+        let mut builder = RociaDbBuilder::new();
+        builder
+            .host("http://127.0.0.1:1")
+            .connect_timeout(Duration::ZERO);
+        // EN: `RociaDbClient` intentionally does not derive `Debug` (it
+        // would expose channel/interceptor internals), so `expect_err`
+        // cannot be used here — match instead.
+        // FR: `RociaDbClient` ne derive volontairement pas `Debug` (cela
+        // exposerait les internals du canal/interceptor), donc
+        // `expect_err` ne peut pas etre utilise ici — on utilise un match
+        // a la place.
+        let error = match builder.build().await {
+            Ok(_) => panic!("a zero connect timeout must fail build()"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RociaDbError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn build_rejects_a_host_with_a_leftover_path_before_any_network_call() {
+        let mut builder = RociaDbBuilder::new();
+        builder.host("http://127.0.0.1:1/v1");
+        let error = match builder.build().await {
+            Ok(_) => panic!("a host carrying a path must fail build()"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RociaDbError::Connection { .. }));
+    }
+
+    // EN: `BuilderAuthConfig`'s manual `Debug` impl must redact
+    // `client_secret` — a derived `Debug` (the pre-fix behavior) would
+    // print it in clear text, so this test would fail against that old
+    // behavior.
+    // FR: L impl `Debug` manuelle de `BuilderAuthConfig` doit rediger
+    // `client_secret` — un `Debug` derive (l ancien comportement) l aurait
+    // affiche en clair, donc ce test echouerait contre cet ancien
+    // comportement.
+    #[test]
+    fn builder_debug_output_redacts_the_client_secret() {
+        let mut builder = RociaDbBuilder::new();
+        builder.auth_client_credentials(
+            "https://idp.example.com/token",
+            "client-123",
+            "super-secret-value",
+        );
+        let debug_output = format!("{builder:?}");
+        assert!(
+            !debug_output.contains("super-secret-value"),
+            "the raw client_secret must never appear in Debug output, got: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("[redacted]"),
+            "the redaction placeholder must appear, got: {debug_output}"
+        );
+        // EN: Non-sensitive fields must stay visible: only the secret is
+        // redacted, not the whole auth config (still useful for
+        // diagnostics).
+        // FR: Les champs non sensibles doivent rester visibles : seul le
+        // secret est redige, pas toute la config d auth (reste utile pour
+        // le diagnostic).
+        assert!(debug_output.contains("https://idp.example.com/token"));
+        assert!(debug_output.contains("client-123"));
+    }
+
+    #[test]
+    fn default_document_request_id_uses_the_put_document_prefix_with_a_fresh_uuid_each_time() {
+        // EN: This is the request_id-prefix consistency fix applied to
+        // `create_document`'s document write: it must default to the same
+        // `put_document:{collection}:<uuid>` shape `put_document` itself
+        // uses, not the pre-0.6.0 `upsert_document:...` prefix.
+        // FR: C est le correctif de coherence des prefixes de request_id
+        // applique a l ecriture document de `create_document` : elle doit
+        // avoir par defaut la meme forme `put_document:{collection}:<uuid>`
+        // qu utilise `put_document` lui-meme, pas le prefixe
+        // `upsert_document:...` d avant 0.6.0.
+        let first = default_document_request_id("catalog");
+        let second = default_document_request_id("catalog");
+        let uuid_part = first
+            .strip_prefix("put_document:catalog:")
+            .expect("default request_id must use the put_document:{collection}: prefix");
+        uuid::Uuid::parse_str(uuid_part).expect("suffix after the prefix must be a uuid");
+        assert_ne!(
+            first, second,
+            "each call without an explicit request_id must get its own generated id"
+        );
+    }
+
+    // EN: `upload_file_chunked`'s pre-flight validation (file size,
+    // checksum length) must run — and fail — before the method ever
+    // touches the network, so these tests run against a client wired to
+    // an unreachable host and must still return promptly.
+    // FR: La validation prealable de `upload_file_chunked` (taille du
+    // fichier, longueur du checksum) doit s executer — et echouer — avant
+    // que la methode ne touche le reseau, donc ces tests s executent
+    // contre un client cable sur un host injoignable et doivent quand
+    // meme retourner promptement.
+
+    #[tokio::test]
+    async fn upload_file_chunked_rejects_an_oversized_file_before_any_network_call() {
+        let client = lazy_test_client();
+        let oversized = 5u64 * 1024 * 1024 * 1024 + 1; // 5 GiB + 1 byte
+        let result = client
+            .upload_file_chunked(
+                "tenant",
+                "bucket",
+                "file",
+                oversized,
+                vec![0u8; 32],
+                stream::empty::<Vec<u8>>(),
+                FileStreamUploadOptions::default(),
+            )
+            .await;
+        let error = result.expect_err("a file over the 5 GiB limit must be rejected");
+        assert!(matches!(error, RociaDbError::Validation(_)));
+        assert!(error.to_string().contains("5 GiB"));
+    }
+
+    #[tokio::test]
+    async fn upload_file_chunked_rejects_a_wrong_length_checksum_before_any_network_call() {
+        let client = lazy_test_client();
+        let result = client
+            .upload_file_chunked(
+                "tenant",
+                "bucket",
+                "file",
+                0,
+                vec![0u8; 10], // must be exactly 32 bytes (sha256)
+                stream::empty::<Vec<u8>>(),
+                FileStreamUploadOptions::default(),
+            )
+            .await;
+        let error = result.expect_err("a checksum that is not 32 bytes must be rejected");
+        assert!(matches!(error, RociaDbError::Validation(_)));
+        assert!(error.to_string().contains("32 bytes"));
+    }
+
+    #[tokio::test]
+    async fn invalidate_auth_token_is_a_harmless_no_op_when_auth_is_disabled() {
+        // EN: `lazy_test_client()` itself needs a tokio runtime just to
+        // build its (never-dialed) channel — but `invalidate_auth_token`
+        // is called here with no `.await`, which is the point: it is
+        // synchronous by design and must never need to wait on a network
+        // round trip, unlike `refresh_auth_token`.
+        // FR: `lazy_test_client()` a elle-meme besoin d un runtime tokio
+        // seulement pour construire son canal (jamais compose) — mais
+        // `invalidate_auth_token` est appelee ici sans `.await`, ce qui
+        // est precisement le point : elle est synchrone par conception et
+        // ne doit jamais avoir besoin d attendre un round-trip reseau,
+        // contrairement a `refresh_auth_token`.
+        let client = lazy_test_client();
+        client.invalidate_auth_token();
     }
 }
