@@ -1,17 +1,10 @@
-//! EN: Compile-time proof that a `RociaDbClient` shared behind an `Arc` is
-//! usable without a `Mutex`. This is the whole point of the 0.4.0 move from
-//! `&mut self` to `&self`: with `&mut self`, none of the calls below would
-//! type-check through an `Arc`, and callers had to serialise every request.
-//! FR: Preuve a la compilation qu un `RociaDbClient` partage derriere un `Arc`
-//! est utilisable sans `Mutex`. C est tout l interet du passage de `&mut self`
-//! a `&self` en 0.4.0 : avec `&mut self`, aucun des appels ci-dessous ne
-//! compilerait a travers un `Arc`, et l appelant devait serialiser chaque
-//! requete.
+//! Compile-time proof that a `RociaDbClient` shared behind an `Arc` is usable
+//! without a `Mutex`: every method takes `&self`, so none of the calls below
+//! would fail to type-check through an `Arc`, and callers never need to
+//! serialise requests.
 //!
-//! EN: Nothing here runs a request — the functions are never called. They only
+//! Nothing here runs a request — the functions are never called. They only
 //! have to compile.
-//! FR: Rien ici n execute de requete — les fonctions ne sont jamais appelees.
-//! Elles doivent seulement compiler.
 
 use rocia_db_sdk::{
     DocumentQueryFilter, DocumentQueryOperator, EdgeInput, NodeInput, Result, RociaDbClient,
@@ -47,10 +40,8 @@ async fn writes_through_an_arc(client: Arc<RociaDbClient>) -> Result<()> {
     Ok(())
 }
 
-// EN: The shared client must survive being sent across tasks, which is what a
+// The shared client must survive being sent across tasks, which is what a
 // caller actually does with an `Arc`.
-// FR: Le client partage doit survivre a l envoi entre taches, ce qu un appelant
-// fait reellement avec un `Arc`.
 #[allow(dead_code)]
 fn spawns_concurrent_readers(client: Arc<RociaDbClient>) {
     for _ in 0..4 {
@@ -68,12 +59,9 @@ fn spawns_concurrent_readers(client: Arc<RociaDbClient>) {
     }
 }
 
-// EN: The 0.5.0 batch helpers take `impl IntoIterator` on `&self`. That
-// combination is the one most likely to stop compiling through an `Arc`, so
-// pin it here alongside the single-item calls.
-// FR: Les helpers de batch 0.5.0 prennent un `impl IntoIterator` sur `&self`.
-// C est la combinaison la plus susceptible de cesser de compiler a travers un
-// `Arc`, on la verrouille donc ici a cote des appels unitaires.
+// The batch helpers take `impl IntoIterator` on `&self`. That combination is
+// the one most likely to stop compiling through an `Arc`, so pin it here
+// alongside the single-item calls.
 #[allow(dead_code)]
 async fn batches_through_an_arc(client: Arc<RociaDbClient>) -> Result<()> {
     client

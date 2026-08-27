@@ -1,5 +1,4 @@
-// EN: Build script to generate gRPC client code from protos.
-// FR: Script de build pour generer le code gRPC depuis les protos.
+// Build script to generate gRPC client code from protos.
 use std::env;
 use std::path::PathBuf;
 

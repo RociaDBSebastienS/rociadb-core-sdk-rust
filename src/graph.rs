@@ -29,29 +29,15 @@ enum NeighborDirection {
     Incoming,
 }
 
-/// EN: Decide whether neighbor pagination should keep going, given the
-/// cursor just used (`current_cursor`) and the `next_cursor` the last page
-/// came back with. Continues on any fresh cursor — including when the page
-/// that carried it was empty or shorter than the requested limit, since the
+/// Decide whether neighbor pagination should keep going, given the cursor
+/// just used (`current_cursor`) and the `next_cursor` the last page came
+/// back with. Continues on any fresh cursor — including when the page that
+/// carried it was empty or shorter than the requested limit, since the
 /// server can legitimately hand back a short or empty page mid-listing (a
 /// stale index entry pointing at a deleted node, for example) followed by
 /// more data. Stops only when `next_cursor` is absent, or when the server
 /// repeats the cursor we just used (a guard against an infinite loop on a
-/// misbehaving server). Pulled out of [`RociaDbClient::get_neighbor_nodes`]
-/// as a pure function so this decision is unit-testable without a live
-/// client.
-/// FR: Decide si la pagination des voisins doit continuer, a partir du
-/// curseur qui vient d etre utilise (`current_cursor`) et du `next_cursor`
-/// renvoye par la derniere page. Continue sur tout curseur nouveau — meme
-/// quand la page qui le portait etait vide ou plus courte que la limite
-/// demandee, car le serveur peut legitimement renvoyer une page courte ou
-/// vide au milieu d un listing (par exemple une entree d index perimee
-/// pointant vers un node supprime) suivie d autres donnees. S arrete
-/// seulement quand `next_cursor` est absent, ou quand le serveur repete le
-/// curseur qu on vient d utiliser (garde-fou contre une boucle infinie sur
-/// un serveur qui se comporte mal). Extraite de
-/// [`RociaDbClient::get_neighbor_nodes`] en fonction pure pour que cette
-/// decision soit testable unitairement sans client reel.
+/// misbehaving server).
 fn next_pagination_cursor(
     current_cursor: Option<&str>,
     next_cursor: Option<String>,
@@ -348,19 +334,8 @@ impl RociaDbClient {
         .await
     }
 
-    // EN: Paginates until `next_cursor` comes back absent (or repeats the
-    // cursor we just used, as a guard against a misbehaving server looping
-    // forever) — never merely because a page was empty or shorter than
-    // `limit`. The server can legitimately hand back a short or empty page
-    // in the middle of a listing (for example an index entry surviving a
-    // deleted node) with more data still to come after it.
-    // FR: Pagine jusqu a ce que `next_cursor` soit absent (ou repete le
-    // curseur qu on vient d utiliser, en garde-fou contre un serveur qui
-    // boucle indefiniment) — jamais simplement parce qu une page est vide
-    // ou plus courte que `limit`. Le serveur peut legitimement renvoyer une
-    // page courte ou vide au milieu d un listing (par exemple une entree d
-    // index survivant a un node supprime) avec encore des donnees a venir
-    // ensuite.
+    // Paginates via `next_pagination_cursor`: see its doc for why an empty
+    // or short page never stops the loop on its own.
     async fn get_neighbor_nodes<T: DeserializeOwned>(
         &self,
         tenant_id: &str,
@@ -454,38 +429,18 @@ mod tests {
     #[test]
     fn zero_limit_is_rejected() {
         let error = page_request(Some(0), None).expect_err("limit 0 should be rejected");
-        // EN: A null page limit is a client-side rule, so it must surface
-        // as `RociaDbError::Validation`, not a generic/catch-all variant,
-        // and the message must say why.
-        // FR: Une limite de page nulle est une regle cote client, elle
-        // doit donc apparaitre en `RociaDbError::Validation`, pas en
-        // variante generique/fourre-tout, et le message doit dire
-        // pourquoi.
         assert!(matches!(error, RociaDbError::Validation(_)));
         assert!(error.to_string().contains("greater than zero"));
     }
 
     #[test]
     fn pagination_stops_when_next_cursor_is_absent() {
-        // EN: An absent next_cursor is the only real end-of-list signal,
-        // regardless of whether the page was empty or short.
-        // FR: L absence de next_cursor est le seul vrai signal de fin de
-        // liste, que la page ait ete vide ou courte ou non.
         assert_eq!(next_pagination_cursor(None, None), None);
         assert_eq!(next_pagination_cursor(Some("cursor-1"), None), None);
     }
 
     #[test]
     fn pagination_continues_on_empty_page_with_a_fresh_cursor() {
-        // EN: This is the exact bug this pure function guards against: the
-        // server can return an empty (or short) page in the middle of a
-        // listing, still carrying a next_cursor, and pagination must keep
-        // going rather than stop just because that one page had no items.
-        // FR: C est exactement le bug contre lequel cette fonction pure
-        // protege : le serveur peut renvoyer une page vide (ou courte) au
-        // milieu d un listing, en portant quand meme un next_cursor, et la
-        // pagination doit continuer plutot que s arreter juste parce que
-        // cette page n avait aucun element.
         assert_eq!(
             next_pagination_cursor(None, Some("cursor-1".to_string())),
             Some("cursor-1".to_string())
@@ -498,11 +453,6 @@ mod tests {
 
     #[test]
     fn pagination_stops_on_a_repeated_cursor() {
-        // EN: Guard against an infinite loop if a misbehaving server ever
-        // echoes back the same cursor it was just given.
-        // FR: Garde-fou contre une boucle infinie si un serveur qui se
-        // comporte mal renvoie un jour le meme curseur que celui qu on
-        // vient de lui donner.
         assert_eq!(
             next_pagination_cursor(Some("cursor-1"), Some("cursor-1".to_string())),
             None

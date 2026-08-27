@@ -1,23 +1,14 @@
-//! EN: Public error type returned by every fallible `RociaDbClient` method.
+//! Public error type returned by every fallible `RociaDbClient` method.
 //!
 //! Every public method returns [`Result<T>`], an alias for
 //! `std::result::Result<T, RociaDbError>`. Callers that need to branch on
 //! the failure kind can `match` on [`RociaDbError`] directly instead of
 //! reaching for `downcast_ref` on a boxed `dyn Error`.
-//! FR: Type d'erreur public retourne par toutes les methodes faillibles de
-//! `RociaDbClient`.
-//!
-//! Toute methode publique retourne [`Result<T>`], un alias pour
-//! `std::result::Result<T, RociaDbError>`. Les appelants qui doivent
-//! distinguer le type d echec peuvent faire un `match` direct sur
-//! [`RociaDbError`] plutot que recourir a `downcast_ref` sur un `dyn Error`
-//! boxe.
 
-/// EN: Result alias used throughout the public API.
-/// FR: Alias de `Result` utilise dans toute l API publique.
+/// Result alias used throughout the public API.
 pub type Result<T> = std::result::Result<T, RociaDbError>;
 
-/// EN: Error returned by the SDK.
+/// Error returned by the SDK.
 ///
 /// The [`RociaDbError::Status`] variant is the one produced by every failed
 /// gRPC call: it carries the raw [`tonic::Status`], so nothing is lost
@@ -31,42 +22,21 @@ pub type Result<T> = std::result::Result<T, RociaDbError>;
 /// `PERMISSION_DENIED` is final — the token is valid but lacks the required
 /// scope, and retrying after a refresh will not help (see
 /// [`RociaDbError::is_permission_denied`]).
-/// FR: Erreur retournee par le SDK.
-///
-/// Le variant [`RociaDbError::Status`] est celui produit par tout appel
-/// gRPC en echec : il porte le [`tonic::Status`] brut, donc rien n est
-/// perdu par rapport a un appel direct au client genere. Au-dela du code
-/// gRPC standard, le serveur upstream attache toujours une metadonnee
-/// `reason` plus fine que le seul code — voir [`RociaDbError::reason`]. En
-/// particulier le serveur traite `UNAUTHENTICATED` comme un signal de
-/// renouvellement du token d auth (voir
-/// [`RociaDbError::is_unauthenticated`] et
-/// [`crate::RociaDbClient::refresh_auth_token`]), alors que
-/// `PERMISSION_DENIED` est definitif — le token est valide mais manque du
-/// scope requis, et reessayer apres un refresh n aidera pas (voir
-/// [`RociaDbError::is_permission_denied`]).
 #[derive(Debug, thiserror::Error)]
 pub enum RociaDbError {
-    /// EN: A gRPC call to the upstream server returned a non-OK status.
-    /// FR: Un appel gRPC vers le serveur upstream a renvoye un statut non-OK.
+    /// A gRPC call to the upstream server returned a non-OK status.
     #[error("{operation}: {status}")]
     Status {
-        /// EN: Short description of the failed operation (for example
-        /// `"failed to upsert document"`).
-        /// FR: Courte description de l operation en echec (par exemple
+        /// Short description of the failed operation (for example
         /// `"failed to upsert document"`).
         operation: &'static str,
         #[source]
         status: tonic::Status,
     },
 
-    /// EN: Failed to connect to, or configure, the upstream endpoint:
-    /// invalid host, TLS setup, connection refused, or missing builder
+    /// Failed to connect to, or configure, the upstream endpoint: invalid
+    /// host, TLS setup, connection refused, or missing builder
     /// configuration (host, token URL, client id/secret).
-    /// FR: Echec de connexion, ou de configuration, de l endpoint upstream :
-    /// host invalide, configuration TLS, connexion refusee, ou
-    /// configuration du builder manquante (host, token URL, client
-    /// id/secret).
     #[error("{message}")]
     Connection {
         message: String,
@@ -74,8 +44,7 @@ pub enum RociaDbError {
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
 
-    /// EN: Failed to obtain or refresh the upstream auth token.
-    /// FR: Echec d obtention ou de renouvellement du token d auth upstream.
+    /// Failed to obtain or refresh the upstream auth token.
     #[error("{message}")]
     Auth {
         message: String,
@@ -83,8 +52,7 @@ pub enum RociaDbError {
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
 
-    /// EN: Failed to encode a value as JSON before sending it upstream.
-    /// FR: Echec d encodage d une valeur en JSON avant envoi upstream.
+    /// Failed to encode a value as JSON before sending it upstream.
     #[error("failed to encode {context}")]
     Encode {
         context: &'static str,
@@ -92,8 +60,7 @@ pub enum RociaDbError {
         source: serde_json::Error,
     },
 
-    /// EN: Failed to decode a JSON payload received from upstream.
-    /// FR: Echec de decodage d un payload JSON recu de l upstream.
+    /// Failed to decode a JSON payload received from upstream.
     #[error("failed to decode {context}")]
     Decode {
         context: &'static str,
@@ -101,22 +68,16 @@ pub enum RociaDbError {
         source: serde_json::Error,
     },
 
-    /// EN: A client-side validation rule was violated before any network
-    /// call was made (a null page limit, a checksum of the wrong length,
-    /// an incomplete `node_label`/`node_graph` pair, a file size out of
+    /// A client-side validation rule was violated before any network call
+    /// was made (a null page limit, a checksum of the wrong length, an
+    /// incomplete `node_label`/`node_graph` pair, a file size out of
     /// bounds, etc).
-    /// FR: Une regle de validation cote client a ete violee avant tout
-    /// appel reseau (limite de page nulle, checksum de mauvaise longueur,
-    /// couple `node_label`/`node_graph` incomplet, taille de fichier hors
-    /// bornes, etc).
     #[error("{0}")]
     Validation(String),
 }
 
 impl RociaDbError {
-    /// EN: The gRPC status code, present only for [`RociaDbError::Status`].
-    /// FR: Le code de statut gRPC, present uniquement pour
-    /// [`RociaDbError::Status`].
+    /// The gRPC status code, present only for [`RociaDbError::Status`].
     pub fn code(&self) -> Option<tonic::Code> {
         match self {
             Self::Status { status, .. } => Some(status.code()),
@@ -124,15 +85,10 @@ impl RociaDbError {
         }
     }
 
-    /// EN: The server's `reason` trailing metadata — one of
-    /// `invalid_argument`, `not_found`, `already_exists`,
-    /// `permission_denied`, `unauthenticated`, `internal` — present only
-    /// for [`RociaDbError::Status`]. Finer-grained than [`Self::code`]
-    /// alone.
-    /// FR: La metadonnee `reason` du serveur — `invalid_argument`,
+    /// The server's `reason` trailing metadata — one of `invalid_argument`,
     /// `not_found`, `already_exists`, `permission_denied`,
-    /// `unauthenticated`, ou `internal` — presente uniquement pour
-    /// [`RociaDbError::Status`]. Plus fine que [`Self::code`] seul.
+    /// `unauthenticated`, `internal` — present only for
+    /// [`RociaDbError::Status`]. Finer-grained than [`Self::code`] alone.
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Status { status, .. } => status
@@ -143,9 +99,7 @@ impl RociaDbError {
         }
     }
 
-    /// EN: The raw gRPC status, present only for [`RociaDbError::Status`].
-    /// FR: Le statut gRPC brut, present uniquement pour
-    /// [`RociaDbError::Status`].
+    /// The raw gRPC status, present only for [`RociaDbError::Status`].
     pub fn status(&self) -> Option<&tonic::Status> {
         match self {
             Self::Status { status, .. } => Some(status),
@@ -153,24 +107,16 @@ impl RociaDbError {
         }
     }
 
-    /// EN: True when the server rejected the call as unauthenticated. The
+    /// True when the server rejected the call as unauthenticated. The
     /// server treats this as a renewal signal: call
     /// [`crate::RociaDbClient::refresh_auth_token`] and retry.
-    /// FR: Vrai quand le serveur a rejete l appel comme non authentifie. Le
-    /// serveur traite cela comme un signal de renouvellement : appelez
-    /// [`crate::RociaDbClient::refresh_auth_token`] puis reessayez.
     pub fn is_unauthenticated(&self) -> bool {
         self.code() == Some(tonic::Code::Unauthenticated)
     }
 
-    /// EN: True when the server rejected the call for lacking permission.
+    /// True when the server rejected the call for lacking permission.
     /// Unlike [`Self::is_unauthenticated`], this is final: the token is
-    /// valid but lacks the required scope, and refreshing it will not
-    /// help.
-    /// FR: Vrai quand le serveur a rejete l appel faute de permission.
-    /// Contrairement a [`Self::is_unauthenticated`], c est definitif : le
-    /// token est valide mais manque du scope requis, le rafraichir n
-    /// aidera pas.
+    /// valid but lacks the required scope, and refreshing it will not help.
     pub fn is_permission_denied(&self) -> bool {
         self.code() == Some(tonic::Code::PermissionDenied)
     }
@@ -196,12 +142,9 @@ impl RociaDbError {
     }
 }
 
-/// EN: Extension trait mapping a failed gRPC call into
-/// [`RociaDbError::Status`], mirroring anyhow's `.context(...)` ergonomics
-/// for the one error source that must stay fully typed.
-/// FR: Trait d extension qui transforme un appel gRPC en echec en
-/// [`RociaDbError::Status`], avec l ergonomie du `.context(...)` d anyhow,
-/// pour la seule source d erreur qui doit rester entierement typee.
+/// Extension trait mapping a failed gRPC call into [`RociaDbError::Status`],
+/// mirroring anyhow's `.context(...)` ergonomics for the one error source
+/// that must stay fully typed.
 pub(crate) trait StatusResultExt<T> {
     fn status_context(self, operation: &'static str) -> Result<T>;
 }
@@ -212,15 +155,10 @@ impl<T> StatusResultExt<T> for std::result::Result<T, tonic::Status> {
     }
 }
 
-/// EN: Extension trait wrapping any connection/config failure into
+/// Extension trait wrapping any connection/config failure into
 /// [`RociaDbError::Connection`]. Also accepts another [`RociaDbError`] as
 /// the source, so a higher-level step (for example "failed to initialize
 /// token manager") can nest a lower-level one without losing it.
-/// FR: Trait d extension qui enveloppe tout echec de connexion/config dans
-/// [`RociaDbError::Connection`]. Accepte aussi un autre [`RociaDbError`]
-/// comme source, pour qu une etape de plus haut niveau (par exemple
-/// "failed to initialize token manager") puisse imbriquer une erreur de
-/// plus bas niveau sans la perdre.
 pub(crate) trait ConnectionResultExt<T> {
     fn connection_context(self, message: &str) -> Result<T>;
 }
@@ -237,12 +175,9 @@ where
     }
 }
 
-/// EN: Extension trait wrapping any auth-token failure into
+/// Extension trait wrapping any auth-token failure into
 /// [`RociaDbError::Auth`]. Also accepts another [`RociaDbError`] as the
 /// source (see [`ConnectionResultExt`] for why).
-/// FR: Trait d extension qui enveloppe tout echec lie au token d auth dans
-/// [`RociaDbError::Auth`]. Accepte aussi un autre [`RociaDbError`] comme
-/// source (voir [`ConnectionResultExt`] pour la raison).
 pub(crate) trait AuthResultExt<T> {
     fn auth_context(self, message: &str) -> Result<T>;
 }
@@ -259,10 +194,8 @@ where
     }
 }
 
-/// EN: Extension trait mapping `serde_json` (de)serialization failures
-/// into [`RociaDbError::Encode`] / [`RociaDbError::Decode`].
-/// FR: Trait d extension qui transforme les echecs de (de)serialisation
-/// `serde_json` en [`RociaDbError::Encode`] / [`RociaDbError::Decode`].
+/// Extension trait mapping `serde_json` (de)serialization failures into
+/// [`RociaDbError::Encode`] / [`RociaDbError::Decode`].
 pub(crate) trait JsonResultExt<T> {
     fn encode_context(self, context: &'static str) -> Result<T>;
     fn decode_context(self, context: &'static str) -> Result<T>;
@@ -296,12 +229,9 @@ mod tests {
 
     #[test]
     fn status_error_exposes_code_and_server_reason() {
-        // EN: The server always attaches a `reason` trailing metadata value
+        // The server always attaches a `reason` trailing metadata value
         // finer-grained than the gRPC code; both must survive the trip
         // into `RociaDbError::Status` unchanged.
-        // FR: Le serveur attache toujours une metadonnee `reason` plus fine
-        // que le code gRPC ; les deux doivent survivre intacts dans
-        // `RociaDbError::Status`.
         let status = status_with_reason(Code::NotFound, "document not found", "not_found");
         let error = RociaDbError::Status {
             operation: "failed to get document",
@@ -315,12 +245,9 @@ mod tests {
             Some(Code::NotFound)
         );
 
-        // EN: The message must stay informative: both the high-level
-        // operation and the server-provided detail should be readable in
-        // the Display output, not just the bare variant name.
-        // FR: Le message doit rester informatif : l operation de haut
-        // niveau et le detail fourni par le serveur doivent etre lisibles
-        // dans le Display, pas seulement le nom du variant.
+        // The message must stay informative: both the high-level operation
+        // and the server-provided detail should be readable in the Display
+        // output, not just the bare variant name.
         let message = error.to_string();
         assert!(
             message.contains("failed to get document"),
@@ -385,12 +312,9 @@ mod tests {
 
     #[test]
     fn non_status_variants_carry_no_grpc_code_reason_or_status() {
-        // EN: `code`/`reason`/`status`/the two auth predicates only make
-        // sense for a failed gRPC call; every other variant must report
-        // "absent" rather than panicking or fabricating a value.
-        // FR: `code`/`reason`/`status`/les deux predicats d auth n ont de
-        // sens que pour un appel gRPC en echec ; toute autre variante doit
-        // rapporter "absent" plutot que paniquer ou inventer une valeur.
+        // `code`/`reason`/`status`/the two auth predicates only make sense
+        // for a failed gRPC call; every other variant must report "absent"
+        // rather than panicking or fabricating a value.
         let validation = RociaDbError::validation("page limit must be greater than zero");
         assert_eq!(validation.code(), None);
         assert_eq!(validation.reason(), None);
@@ -401,12 +325,6 @@ mod tests {
 
     #[test]
     fn validation_constructor_produces_the_validation_variant_with_an_informative_message() {
-        // EN: Client-side validation failures must come back as
-        // `RociaDbError::Validation`, not folded into a catch-all variant,
-        // and the message must say what rule was broken.
-        // FR: Les echecs de validation cote client doivent revenir en
-        // `RociaDbError::Validation`, pas noyes dans une variante fourre-
-        // tout, et le message doit dire quelle regle a ete enfreinte.
         let error = RociaDbError::validation("checksum must be exactly 32 bytes (sha256)");
         assert!(matches!(error, RociaDbError::Validation(_)));
         assert_eq!(
@@ -466,15 +384,10 @@ mod tests {
             "message should name what failed to decode, got: {decode_error}"
         );
 
-        // EN: serde_json has no built-in value that fails to serialize
-        // (it maps NaN/Infinity to `null` rather than erroring), so a
-        // minimal `Serialize` impl that always errors is the deterministic
-        // way to exercise the Encode path too, without any network call.
-        // FR: serde_json n a aucune valeur integree qui echoue a la
-        // serialisation (NaN/Infinity sont convertis en `null` plutot que
-        // de faire erreur), donc un `Serialize` minimal qui echoue toujours
-        // est le moyen deterministe d exercer aussi le chemin Encode, sans
-        // aucun appel reseau.
+        // serde_json has no built-in value that fails to serialize (it maps
+        // NaN/Infinity to `null` rather than erroring), so a minimal
+        // `Serialize` impl that always errors is the deterministic way to
+        // exercise the Encode path too, without any network call.
         struct AlwaysFailsToSerialize;
         impl serde::Serialize for AlwaysFailsToSerialize {
             fn serialize<S: serde::Serializer>(
@@ -514,10 +427,8 @@ mod tests {
             "the underlying io::Error must be preserved as the source"
         );
 
-        // EN: A higher-level step can nest an already-typed RociaDbError
+        // A higher-level step can nest an already-typed RociaDbError
         // without losing it, mirroring anyhow's context chaining.
-        // FR: Une etape de plus haut niveau peut imbriquer un RociaDbError
-        // deja type sans le perdre, comme le chainage de contexte d anyhow.
         let inner: std::result::Result<(), RociaDbError> =
             Err(RociaDbError::validation("host must not be empty"));
         let nested = inner

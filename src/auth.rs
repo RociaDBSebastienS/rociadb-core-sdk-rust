@@ -1,5 +1,4 @@
-//! EN: Auth helpers for bearer tokens and API keys.
-//! FR: Helpers auth pour tokens bearer et cles API.
+//! Auth helpers for bearer tokens and API keys.
 #![allow(clippy::doc_lazy_continuation)]
 
 use crate::error::AuthResultExt;
@@ -15,14 +14,11 @@ use tonic::metadata::{Ascii, MetadataKey, MetadataValue};
 use tonic::{Request, Status, service::Interceptor};
 use tracing::warn;
 
-/// EN: Floor applied to the derived refresh interval, in case the IdP ever
+/// Floor applied to the derived refresh interval, in case the IdP ever
 /// advertises a very short (or zero) token lifetime.
-/// FR: Plancher applique a l intervalle de refresh derive, au cas ou l IdP
-/// annoncerait une duree de vie de token tres courte (voire nulle).
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// EN: Response payload for OAuth2 client credentials token.
-/// FR: Payload de reponse pour token OAuth2 client credentials.
+/// Response payload for OAuth2 client credentials token.
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -30,24 +26,7 @@ pub struct TokenResponse {
     pub token_type: String,
 }
 
-/// EN: Fetch a token using client credentials.
-/// FR: Recupere un token via client credentials.
-///
-/// EN: Arguments:
-/// - `http`: Reqwest client instance.
-/// - `token_url`: Token endpoint URL.
-/// - `client_id`: OAuth2 client id.
-/// - `client_secret`: OAuth2 client secret.
-/// FR: Arguments:
-/// - `http`: Instance du client Reqwest.
-/// - `token_url`: URL de l endpoint token.
-/// - `client_id`: Client id OAuth2.
-/// - `client_secret`: Client secret OAuth2.
-///
-/// EN: Returns:
-/// - `TokenResponse` on success.
-/// FR: Returns:
-/// - `TokenResponse` en cas de succes.
+/// Fetch a token using client credentials.
 pub async fn fetch_token(
     http: &reqwest::Client,
     token_url: &str,
@@ -72,8 +51,7 @@ pub async fn fetch_token(
         .auth_context("failed to parse token response")
 }
 
-/// EN: Token manager with cached authorization header.
-/// FR: Gestionnaire de token avec header authorisation en cache.
+/// Token manager with cached authorization header.
 #[derive(Clone)]
 pub struct TokenManager {
     inner: Arc<TokenManagerInner>,
@@ -85,47 +63,20 @@ struct TokenManagerInner {
     client_id: String,
     client_secret: String,
     header_value: Arc<RwLock<MetadataValue<Ascii>>>,
-    /// EN: `expires_in` (seconds) from the most recently fetched token, as
+    /// `expires_in` (seconds) from the most recently fetched token, as
     /// reported by the IdP. Drives [`TokenManager::refresh_interval`].
-    /// FR: `expires_in` (secondes) du token le plus recemment recupere,
-    /// tel que renvoye par l IdP. Pilote
-    /// [`TokenManager::refresh_interval`].
     expires_in: AtomicU64,
-    /// EN: Wakes the background task spawned by [`TokenManager::spawn_refresh`]
+    /// Wakes the background task spawned by [`TokenManager::spawn_refresh`]
     /// as soon as possible, without the caller waiting for the network
     /// round trip. See [`TokenManager::request_refresh`]. A `notify_one()`
     /// call with no task currently waiting stores a permit that the next
     /// `notified().await` consumes immediately, so a request issued between
     /// two loop iterations of the background task is never lost.
-    /// FR: Reveille des que possible la tache en arriere-plan lancee par
-    /// [`TokenManager::spawn_refresh`], sans que l appelant attende le
-    /// round-trip reseau. Voir [`TokenManager::request_refresh`]. Un appel
-    /// `notify_one()` sans tache en attente stocke un permit que le
-    /// prochain `notified().await` consomme immediatement, donc une
-    /// demande emise entre deux iterations de boucle de la tache en
-    /// arriere-plan n est jamais perdue.
     refresh_notify: Notify,
 }
 
 impl TokenManager {
-    /// EN: Create a new token manager and fetch the first token.
-    /// FR: Cree un token manager et recupere le premier token.
-    ///
-    /// EN: Arguments:
-    /// - `http`: Reqwest client instance.
-    /// - `token_url`: Token endpoint URL.
-    /// - `client_id`: OAuth2 client id.
-    /// - `client_secret`: OAuth2 client secret.
-    /// FR: Arguments:
-    /// - `http`: Instance du client Reqwest.
-    /// - `token_url`: URL de l endpoint token.
-    /// - `client_id`: Client id OAuth2.
-    /// - `client_secret`: Client secret OAuth2.
-    ///
-    /// EN: Returns:
-    /// - `TokenManager` on success.
-    /// FR: Returns:
-    /// - `TokenManager` en cas de succes.
+    /// Create a new token manager and fetch the first token.
     pub async fn new(
         http: reqwest::Client,
         token_url: String,
@@ -149,44 +100,24 @@ impl TokenManager {
         })
     }
 
-    /// EN: Derive a safe background-refresh interval from the token
-    /// lifetime (`expires_in`, in seconds) most recently reported by the
-    /// IdP, leaving margin so the token never actually expires between two
+    /// Derive a safe background-refresh interval from the token lifetime
+    /// (`expires_in`, in seconds) most recently reported by the IdP,
+    /// leaving margin so the token never actually expires between two
     /// refreshes: `max(expires_in * 2 / 3, 5s)`. With the IdP's fixed
     /// 600-second lifetime this yields a 400-second interval, i.e. a
     /// refresh with roughly a third of the token's lifetime still left.
-    /// FR: Derive un intervalle de refresh en arriere-plan a partir de
-    /// la duree de vie du token (`expires_in`, en secondes) la plus
-    /// recemment renvoyee par l IdP, en laissant de la marge pour que le
-    /// token n expire jamais reellement entre deux refresh :
-    /// `max(expires_in * 2 / 3, 5s)`. Avec la duree de vie fixe de 600
-    /// secondes de l IdP, cela donne un intervalle de 400 secondes, soit
-    /// un refresh avec environ un tiers de la duree de vie du token
-    /// restant.
     pub fn refresh_interval(&self) -> Duration {
         let expires_in = self.inner.expires_in.load(Ordering::Relaxed);
         let with_margin = expires_in.saturating_mul(2) / 3;
         Duration::from_secs(with_margin).max(MIN_REFRESH_INTERVAL)
     }
 
-    /// EN: Create an interceptor that injects the bearer token.
-    /// FR: Cree un interceptor qui injecte le bearer token.
-    ///
-    /// EN: Returns:
-    /// - `BearerInterceptor` with token injection enabled.
-    /// FR: Returns:
-    /// - `BearerInterceptor` avec injection du token.
+    /// Create an interceptor that injects the bearer token.
     pub fn interceptor(&self) -> BearerInterceptor {
         BearerInterceptor::new(Arc::clone(&self.inner.header_value))
     }
 
-    /// EN: Force a token refresh immediately.
-    /// FR: Force un refresh immediat du token.
-    ///
-    /// EN: Returns:
-    /// - `()` on success.
-    /// FR: Returns:
-    /// - `()` en cas de succes.
+    /// Force a token refresh immediately.
     pub async fn refresh_now(&self) -> Result<()> {
         let token = fetch_token(
             &self.inner.http,
@@ -208,7 +139,7 @@ impl TokenManager {
         Ok(())
     }
 
-    /// EN: Request a token refresh without waiting for it.
+    /// Request a token refresh without waiting for it.
     ///
     /// Unlike [`TokenManager::refresh_now`], this is **synchronous** and
     /// returns immediately: it only wakes the background task started by
@@ -217,34 +148,12 @@ impl TokenManager {
     /// for the network round trip. If no background task is running (for
     /// example, [`TokenManager::spawn_refresh`] was never called), this is
     /// a harmless no-op — the notification is simply never consumed.
-    /// FR: Demande un refresh de token sans l attendre.
-    ///
-    /// Contrairement a [`TokenManager::refresh_now`], ceci est
-    /// **synchrone** et retourne immediatement : cela ne fait que reveiller
-    /// la tache en arriere-plan lancee par
-    /// [`TokenManager::spawn_refresh`] (via un [`tokio::sync::Notify`]
-    /// partage) pour qu elle rafraichisse a la prochaine occasion, sans que
-    /// l appelant paie le round-trip reseau. Si aucune tache en
-    /// arriere-plan ne tourne (par exemple,
-    /// [`TokenManager::spawn_refresh`] n a jamais ete appelee), ceci est un
-    /// no-op inoffensif — la notification n est simplement jamais
-    /// consommee.
     pub fn request_refresh(&self) {
         self.inner.refresh_notify.notify_one();
     }
 
-    /// EN: Spawn a background refresh task.
-    /// FR: Lance une tache de refresh en background.
-    ///
-    /// EN: Arguments:
-    /// - `interval`: Refresh interval.
-    /// FR: Arguments:
-    /// - `interval`: Intervalle de refresh.
-    ///
-    /// EN: Returns:
-    /// - `TokenRefreshGuard` to stop the task on drop.
-    /// FR: Returns:
-    /// - `TokenRefreshGuard` pour stopper la tache au drop.
+    /// Spawn a background refresh task. Returns a [`TokenRefreshGuard`]
+    /// that stops the task on drop.
     pub fn spawn_refresh(&self, interval: Duration) -> TokenRefreshGuard {
         let manager = self.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -258,17 +167,11 @@ impl TokenManager {
                             warn!(error = %err, "token refresh failed");
                         }
                     }
-                    // EN: Woken by `TokenManager::request_refresh` (and thus
+                    // Woken by `TokenManager::request_refresh` (and thus
                     // `RociaDbClient::invalidate_auth_token`) so a caller can
                     // signal "do not trust the cached token" without paying
                     // for the refresh round trip itself — this background
                     // task absorbs that latency instead.
-                    // FR: Reveillee par `TokenManager::request_refresh` (et
-                    // donc `RociaDbClient::invalidate_auth_token`) pour
-                    // qu un appelant puisse signaler "ne fais plus confiance
-                    // au token en cache" sans payer lui-meme le round-trip
-                    // de refresh — cette tache en arriere-plan absorbe cette
-                    // latence a sa place.
                     _ = manager.inner.refresh_notify.notified() => {
                         if let Err(err) = manager.refresh_now().await {
                             warn!(error = %err, "requested token refresh failed");
@@ -288,8 +191,6 @@ impl TokenManager {
     }
 }
 
-// EN: Build the "authorization" metadata value.
-// FR: Construit la valeur "authorization" pour les metadata.
 fn build_header(token: &TokenResponse) -> Result<MetadataValue<Ascii>> {
     let bearer = format!("{} {}", token.token_type, token.access_token);
     bearer
@@ -297,22 +198,13 @@ fn build_header(token: &TokenResponse) -> Result<MetadataValue<Ascii>> {
         .auth_context("invalid access token metadata value")
 }
 
-/// EN: Drop guard for the refresh task.
+/// Drop guard for the refresh task.
 ///
-/// EN: Dropping this immediately stops the background refresh: bind it to
-/// a variable that lives as long as the client needs auth to keep working
+/// Dropping this immediately stops the background refresh: bind it to a
+/// variable that lives as long as the client needs auth to keep working
 /// (`RociaDbBuilder::build` does this for you). `#[must_use]` catches the
-/// common mistake of calling `spawn_refresh(..)` and discarding the
-/// result, which would stop the refresh task right away.
-/// FR: Guard de fin de vie pour la tache de refresh.
-///
-/// FR: Le laisser tomber (drop) stoppe immediatement le refresh en
-/// arriere-plan : liez-le a une variable qui vit aussi longtemps que le
-/// client a besoin que l auth continue de fonctionner
-/// (`RociaDbBuilder::build` le fait pour vous). `#[must_use]` attrape
-/// l erreur classique consistant a appeler `spawn_refresh(..)` en
-/// jetant le resultat, ce qui stopperait la tache de refresh
-/// immediatement.
+/// common mistake of calling `spawn_refresh(..)` and discarding the result,
+/// which would stop the refresh task right away.
 #[must_use = "dropping the guard immediately stops the background token refresh task"]
 pub struct TokenRefreshGuard {
     shutdown: Option<oneshot::Sender<()>>,
@@ -328,8 +220,7 @@ impl Drop for TokenRefreshGuard {
     }
 }
 
-/// EN: Interceptor that injects the bearer token when enabled.
-/// FR: Interceptor qui injecte le bearer token si active.
+/// Interceptor that injects the bearer token when enabled.
 #[derive(Clone)]
 pub struct BearerInterceptor {
     header_value: Option<Arc<RwLock<MetadataValue<Ascii>>>>,
@@ -342,13 +233,7 @@ impl BearerInterceptor {
         }
     }
 
-    /// EN: Create an interceptor that does nothing.
-    /// FR: Cree un interceptor inactif.
-    ///
-    /// EN: Returns:
-    /// - `BearerInterceptor` with injection disabled.
-    /// FR: Returns:
-    /// - `BearerInterceptor` avec injection desactivee.
+    /// Create an interceptor that does nothing.
     pub(crate) fn disabled() -> Self {
         Self { header_value: None }
     }
@@ -367,8 +252,7 @@ impl Interceptor for BearerInterceptor {
     }
 }
 
-/// EN: Interceptor that validates an incoming API key.
-/// FR: Interceptor qui valide une cle API entrante.
+/// Interceptor that validates an incoming API key.
 #[derive(Clone)]
 pub struct ApiKeyInterceptor {
     expected_key: String,
@@ -376,18 +260,7 @@ pub struct ApiKeyInterceptor {
 }
 
 impl ApiKeyInterceptor {
-    /// EN: Create an API key interceptor using the expected key.
-    /// FR: Cree un interceptor API key avec la cle attendue.
-    ///
-    /// EN: Arguments:
-    /// - `expected_key`: Expected API key string.
-    /// FR: Arguments:
-    /// - `expected_key`: Cle API attendue.
-    ///
-    /// EN: Returns:
-    /// - `ApiKeyInterceptor`.
-    /// FR: Returns:
-    /// - `ApiKeyInterceptor`.
+    /// Create an API key interceptor using the expected key.
     pub fn new(expected_key: String) -> Self {
         Self {
             expected_key,
@@ -420,17 +293,11 @@ impl Interceptor for ApiKeyInterceptor {
     }
 }
 
-/// EN: Constant-time byte comparison: always inspects every byte of the
-/// longer input before returning, instead of short-circuiting on the first
+/// Constant-time byte comparison: always inspects every byte of the longer
+/// input before returning, instead of short-circuiting on the first
 /// mismatch (what `==` does on `&str`/`&[u8]`). Used by
 /// [`ApiKeyInterceptor::call`] so the time a comparison takes cannot leak,
 /// byte by byte, how much of the provided key matched the expected one.
-/// FR: Comparaison d octets en temps constant : inspecte toujours chaque
-/// octet de l entree la plus longue avant de retourner, plutot que de
-/// s arreter au premier octet different (ce que fait `==` sur
-/// `&str`/`&[u8]`). Utilisee par [`ApiKeyInterceptor::call`] pour que le
-/// temps pris par une comparaison ne puisse pas fuiter, octet par octet,
-/// la portion de la cle fournie qui correspondait a la cle attendue.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = (a.len() != b.len()) as u8;
     for i in 0..a.len().max(b.len()) {
@@ -456,25 +323,10 @@ mod tests {
     use tonic::metadata::{Ascii, MetadataValue};
     use tonic::service::Interceptor;
 
-    // EN: `constant_time_eq` is the timing-safety fix for
-    // `ApiKeyInterceptor::call`, which used to compare the provided and
-    // expected keys with a plain `==` (short-circuits on the first
-    // mismatched byte, leaking timing information about how much of the
-    // key matched). These tests lock in that `constant_time_eq` is a
-    // *correct* equality check — the property `==` already had — while
-    // the always-scan-every-byte property it adds is a non-functional
-    // guarantee enforced by the implementation itself, not observable
-    // through a deterministic unit test.
-    // FR: `constant_time_eq` est le correctif de securite temporelle pour
-    // `ApiKeyInterceptor::call`, qui comparait auparavant la cle fournie
-    // et la cle attendue avec un simple `==` (s arrete au premier octet
-    // different, fuitant une information de timing sur la portion de la
-    // cle qui correspondait). Ces tests verrouillent le fait que
-    // `constant_time_eq` est une comparaison d egalite *correcte` — la
-    // propriete que `==` avait deja — tandis que la propriete "inspecte
-    // toujours chaque octet" qu elle ajoute est une garantie non
-    // fonctionnelle assuree par l implementation elle-meme, non
-    // observable via un test unitaire deterministe.
+    // These tests lock in that `constant_time_eq` is a *correct* equality
+    // check. The always-scan-every-byte property that gives it its
+    // timing-safety guarantee is enforced by the implementation itself and
+    // is not observable through a deterministic unit test.
 
     #[test]
     fn constant_time_eq_accepts_identical_byte_strings() {
@@ -544,21 +396,13 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
     }
 
-    /// EN: Builds a `TokenManager` directly from `TokenManagerInner`
-    /// (rather than via `TokenManager::new`, which performs a real HTTP
-    /// round trip) so these tests stay fully offline. `token_url` is
-    /// deliberately not a well-formed URL: `reqwest` fails to parse it
-    /// and any `.send()` call resolves immediately with an error, without
-    /// ever opening a socket — so a test that calls `refresh_now` here
-    /// stays deterministic and network-free too.
-    /// FR: Construit un `TokenManager` directement a partir de
-    /// `TokenManagerInner` (plutot que via `TokenManager::new`, qui
-    /// effectue un veritable aller-retour HTTP) pour que ces tests restent
-    /// entierement hors-ligne. `token_url` n est deliberement pas une URL
-    /// bien formee : `reqwest` echoue a la parser et tout appel
-    /// `.send()` se resout immediatement avec une erreur, sans jamais
-    /// ouvrir de socket — donc un test qui appelle `refresh_now` ici
-    /// reste lui aussi deterministe et sans reseau.
+    /// Builds a `TokenManager` directly from `TokenManagerInner` (rather
+    /// than via `TokenManager::new`, which performs a real HTTP round trip)
+    /// so these tests stay fully offline. `token_url` is deliberately not a
+    /// well-formed URL: `reqwest` fails to parse it and any `.send()` call
+    /// resolves immediately with an error, without ever opening a socket —
+    /// so a test that calls `refresh_now` here stays deterministic and
+    /// network-free too.
     fn offline_token_manager(header_value: MetadataValue<Ascii>) -> TokenManager {
         TokenManager {
             inner: Arc::new(TokenManagerInner {
@@ -586,24 +430,16 @@ mod tests {
     async fn request_refresh_stores_a_wake_permit_consumed_by_the_next_notified_await() {
         let manager = offline_token_manager(sample_header("token"));
 
-        // EN: `request_refresh` is a plain, non-async function — calling
-        // it with no `.await` is itself part of what this test locks in:
+        // `request_refresh` is a plain, non-async function — calling it
+        // with no `.await` is itself part of what this test locks in:
         // unlike `refresh_now`, it must never make the caller wait for a
         // network round trip.
-        // FR: `request_refresh` est une fonction simple, non-async —
-        // l appeler sans `.await` fait elle-meme partie de ce que ce test
-        // verrouille : contrairement a `refresh_now`, elle ne doit jamais
-        // faire attendre l appelant pour un round-trip reseau.
         manager.request_refresh();
 
-        // EN: A bounded wait: if `request_refresh` regressed into a
-        // no-op, `notified()` would never resolve on its own and this
-        // test would hang instead of failing outright — the timeout turns
-        // that into a clean, fast failure.
-        // FR: Une attente bornee : si `request_refresh` regressait en
-        // no-op, `notified()` ne se resoudrait jamais seule et ce test
-        // bloquerait au lieu d echouer proprement — le timeout transforme
-        // cela en un echec net et rapide.
+        // A bounded wait: if `request_refresh` regressed into a no-op,
+        // `notified()` would never resolve on its own and this test would
+        // hang instead of failing outright — the timeout turns that into a
+        // clean, fast failure.
         tokio::time::timeout(
             Duration::from_millis(200),
             manager.inner.refresh_notify.notified(),
@@ -617,19 +453,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_now_never_replaces_a_still_valid_cached_token_when_the_refresh_fails() {
-        // EN: This is the Rust mirror of the TypeScript-side defect fix
-        // (`TokenManager.metadata()` used to drop a still-valid cached
-        // token when a refresh attempted within the skew margin failed).
-        // Rust's `refresh_now` already only overwrites `header_value` on
-        // success — this test locks that in so a future change cannot
-        // regress it silently.
-        // FR: C est le miroir cote Rust du correctif du defaut cote
-        // TypeScript (`TokenManager.metadata()` perdait un token encore
-        // valide en cache quand un refresh tente dans la marge de skew
-        // echouait). Le `refresh_now` de Rust n ecrase deja `header_value`
-        // qu en cas de succes — ce test verrouille ce comportement pour
-        // qu un changement futur ne puisse pas le faire regresser
-        // silencieusement.
         let original_header = sample_header("still-valid-token");
         let manager = offline_token_manager(original_header.clone());
 

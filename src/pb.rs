@@ -1,4 +1,4 @@
-//! EN: Generated protobuf types and gRPC clients.
+//! Generated protobuf types and gRPC clients.
 //!
 //! This module is **not** part of the SDK's semver contract: it is
 //! regenerated from `proto/upstream/v1/upstream.proto` by prost/tonic, and
@@ -16,28 +16,8 @@
 //! [`crate::Neighbor`], [`crate::UploadRequest`], and
 //! [`crate::DownloadResponse`]. Depend on those re-exports, not on paths
 //! reaching into `pb` directly.
-//! FR: Types protobuf generes et clients gRPC.
-//!
-//! Ce module ne fait **pas** partie du contrat semver du SDK : il est
-//! regenere depuis `proto/upstream/v1/upstream.proto` par prost/tonic, et
-//! une montee de version courante de prost ou tonic peut changer des types
-//! de champs, ajouter des champs, ou autrement remanier ces types generes
-//! sans que l API du SDK elle-meme ne change. Il reste `pub` (plutot que
-//! `pub(crate)`) uniquement parce que les sous-modules du crate ont besoin
-//! de chemins `crate::pb::...` d un module a l autre ; `#[doc(hidden)]` le
-//! garde hors de la documentation publiee et hors de la surface que les
-//! appelants doivent considerer stable.
-//!
-//! La poignee de types generes qui font reellement partie du contrat
-//! public — car ils apparaissent dans une signature de methode publique et
-//! les appelants ont besoin de les nommer — sont reexportes
-//! individuellement a la racine du crate a la place :
-//! [`crate::CollectionInfo`], [`crate::StatResponse`], [`crate::Neighbor`],
-//! [`crate::UploadRequest`], et [`crate::DownloadResponse`]. Dependez de
-//! ces reexports, pas de chemins qui plongent directement dans `pb`.
 pub mod upstream {
-    /// EN: Generated code for the rocia.v1 API.
-    /// FR: Code genere pour l API rocia.v1.
+    /// Generated code for the rocia.v1 API.
     pub mod v1 {
         tonic::include_proto!("rocia.v1");
     }

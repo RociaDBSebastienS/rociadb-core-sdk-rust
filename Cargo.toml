@@ -4,13 +4,7 @@ version = "0.6.0"
 edition = "2024"
 description = "RociaDB-SDK"
 license = "Apache-2.0"
-# EN: Mirrors the TypeScript SDK's `engines.node: ">=20"` in package.json:
-# the lowest toolchain version this crate is declared to build with.
 # 1.85 is the first stable release supporting `edition = "2024"`.
-# FR: Miroir du `engines.node: ">=20"` du package.json du SDK TypeScript :
-# la plus ancienne version de toolchain avec laquelle ce crate est declare
-# compatible. 1.85 est la premiere version stable supportant
-# `edition = "2024"`.
 rust-version = "1.85"
 
 [dependencies]
