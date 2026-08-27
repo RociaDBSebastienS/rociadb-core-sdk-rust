@@ -1,0 +1,500 @@
+use crate::pb::upstream::v1::{
+    AddEdgeRequest, DeleteEdgeRequest, GetNodeRequest, ListGraphsRequest, ListNodesRequest,
+    Neighbor, NeighborsInRequest, NeighborsOutRequest, PutNodeRequest,
+};
+use crate::{CONCURRENT_REQUESTS, Page, RociaDbClient, non_empty, page_request};
+use anyhow::{Context, Result};
+use futures::{StreamExt, TryStreamExt, stream};
+use serde::{Serialize, de::DeserializeOwned};
+use uuid::Uuid;
+
+/// One page of graph neighbors returned by the upstream service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeighborPage {
+    pub neighbors: Vec<Neighbor>,
+    pub next_cursor: Option<String>,
+}
+
+/// A graph neighbor together with its decoded node payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeighborNode<T> {
+    pub edge_id: String,
+    pub node_id: String,
+    pub value: T,
+}
+
+#[derive(Clone, Copy)]
+enum NeighborDirection {
+    Outgoing,
+    Incoming,
+}
+
+/// EN: Decide whether neighbor pagination should keep going, given the
+/// cursor just used (`current_cursor`) and the `next_cursor` the last page
+/// came back with. Continues on any fresh cursor — including when the page
+/// that carried it was empty or shorter than the requested limit, since the
+/// server can legitimately hand back a short or empty page mid-listing (a
+/// stale index entry pointing at a deleted node, for example) followed by
+/// more data. Stops only when `next_cursor` is absent, or when the server
+/// repeats the cursor we just used (a guard against an infinite loop on a
+/// misbehaving server). Pulled out of [`RociaDbClient::get_neighbor_nodes`]
+/// as a pure function so this decision is unit-testable without a live
+/// client.
+/// FR: Decide si la pagination des voisins doit continuer, a partir du
+/// curseur qui vient d etre utilise (`current_cursor`) et du `next_cursor`
+/// renvoye par la derniere page. Continue sur tout curseur nouveau — meme
+/// quand la page qui le portait etait vide ou plus courte que la limite
+/// demandee, car le serveur peut legitimement renvoyer une page courte ou
+/// vide au milieu d un listing (par exemple une entree d index perimee
+/// pointant vers un node supprime) suivie d autres donnees. S arrete
+/// seulement quand `next_cursor` est absent, ou quand le serveur repete le
+/// curseur qu on vient d utiliser (garde-fou contre une boucle infinie sur
+/// un serveur qui se comporte mal). Extraite de
+/// [`RociaDbClient::get_neighbor_nodes`] en fonction pure pour que cette
+/// decision soit testable unitairement sans client reel.
+fn next_pagination_cursor(
+    current_cursor: Option<&str>,
+    next_cursor: Option<String>,
+) -> Option<String> {
+    match next_cursor {
+        Some(next_cursor) if current_cursor != Some(next_cursor.as_str()) => Some(next_cursor),
+        _ => None,
+    }
+}
+
+impl RociaDbClient {
+    /// Fetch one node and decode its JSON payload into the requested type.
+    pub async fn get_node_as<T: DeserializeOwned>(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        node_id: &str,
+    ) -> Result<T> {
+        let response = self
+            .upstream_graph
+            .get_node(GetNodeRequest {
+                tenant_id: tenant_id.to_string(),
+                graph: graph.to_string(),
+                node_id: node_id.to_string(),
+            })
+            .await
+            .context("failed to get node")?
+            .into_inner();
+        serde_json::from_slice(&response.json).context("failed to decode node json")
+    }
+
+    /// Create or replace one node using its complete node id (for example `product:42`).
+    pub async fn put_node<T: Serialize + ?Sized>(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        node_id: &str,
+        value: &T,
+    ) -> Result<()> {
+        self.put_node_with_request_id(
+            tenant_id,
+            graph,
+            node_id,
+            value,
+            format!("put_node:{}", Uuid::new_v4()),
+        )
+        .await
+    }
+
+    /// Create or replace one node with a caller-provided idempotency key.
+    pub async fn put_node_with_request_id<T: Serialize + ?Sized>(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        node_id: &str,
+        value: &T,
+        request_id: impl Into<String>,
+    ) -> Result<()> {
+        let json = serde_json::to_vec(value).context("failed to encode node json")?;
+        self.upstream_graph
+            .put_node(PutNodeRequest {
+                tenant_id: tenant_id.to_string(),
+                graph: graph.to_string(),
+                node_id: node_id.to_string(),
+                json,
+                request_id: request_id.into(),
+            })
+            .await
+            .context("failed to put node")?;
+        Ok(())
+    }
+
+    /// Create or replace one edge.
+    ///
+    /// The server returns `NOT_FOUND` if `from` or `to` does not already
+    /// exist as a node in `graph`: create both endpoint nodes before
+    /// adding an edge between them.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_edge<T: Serialize + ?Sized>(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        edge_id: &str,
+        from: &str,
+        to: &str,
+        label: &str,
+        value: &T,
+    ) -> Result<()> {
+        self.add_edge_with_request_id(
+            tenant_id,
+            graph,
+            edge_id,
+            from,
+            to,
+            label,
+            value,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+    }
+
+    /// Create or replace one edge with a caller-provided idempotency key.
+    ///
+    /// The server returns `NOT_FOUND` if `from` or `to` does not already
+    /// exist as a node in `graph`: create both endpoint nodes before
+    /// adding an edge between them.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_edge_with_request_id<T: Serialize + ?Sized>(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        edge_id: &str,
+        from: &str,
+        to: &str,
+        label: &str,
+        value: &T,
+        request_id: impl Into<String>,
+    ) -> Result<()> {
+        let json = serde_json::to_vec(value).context("failed to encode edge json")?;
+        self.upstream_graph
+            .add_edge(AddEdgeRequest {
+                tenant_id: tenant_id.to_string(),
+                graph: graph.to_string(),
+                edge_id: edge_id.to_string(),
+                from: from.to_string(),
+                to: to.to_string(),
+                label: label.to_string(),
+                json,
+                request_id: request_id.into(),
+            })
+            .await
+            .context("failed to add edge")?;
+        Ok(())
+    }
+
+    /// Delete one edge with a caller-provided idempotency key.
+    pub async fn delete_edge_with_request_id(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        edge_id: &str,
+        request_id: impl Into<String>,
+    ) -> Result<()> {
+        self.upstream_graph
+            .delete_edge(DeleteEdgeRequest {
+                tenant_id: tenant_id.to_string(),
+                graph: graph.to_string(),
+                edge_id: edge_id.to_string(),
+                request_id: request_id.into(),
+            })
+            .await
+            .context("failed to delete edge")?;
+        Ok(())
+    }
+
+    /// Return one paginated page of outgoing neighbors.
+    pub async fn neighbors_out(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        from: &str,
+        label: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<NeighborPage> {
+        let response = self
+            .upstream_graph
+            .neighbors_out(NeighborsOutRequest {
+                tenant_id: tenant_id.to_string(),
+                graph: graph.to_string(),
+                from: from.to_string(),
+                label: label.to_string(),
+                page: page_request(limit, cursor)?,
+            })
+            .await
+            .context("failed to get outgoing neighbors")?
+            .into_inner();
+        Ok(NeighborPage {
+            neighbors: response.neighbors,
+            next_cursor: response.page.and_then(|page| non_empty(page.next_cursor)),
+        })
+    }
+
+    /// Return one paginated page of incoming neighbors.
+    pub async fn neighbors_in(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        to: &str,
+        label: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<NeighborPage> {
+        let response = self
+            .upstream_graph
+            .neighbors_in(NeighborsInRequest {
+                tenant_id: tenant_id.to_string(),
+                graph: graph.to_string(),
+                to: to.to_string(),
+                label: label.to_string(),
+                page: page_request(limit, cursor)?,
+            })
+            .await
+            .context("failed to get incoming neighbors")?
+            .into_inner();
+        Ok(NeighborPage {
+            neighbors: response.neighbors,
+            next_cursor: response.page.and_then(|page| non_empty(page.next_cursor)),
+        })
+    }
+
+    /// Return one paginated page of graph names holding at least one node.
+    pub async fn list_graphs(
+        &mut self,
+        tenant_id: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<Page<String>> {
+        let response = self
+            .upstream_graph
+            .list_graphs(ListGraphsRequest {
+                tenant_id: tenant_id.to_string(),
+                page: page_request(limit, cursor)?,
+            })
+            .await
+            .context("failed to list graphs")?
+            .into_inner();
+        Ok(Page {
+            items: response.graphs,
+            next_cursor: response.page.and_then(|page| non_empty(page.next_cursor)),
+        })
+    }
+
+    /// Return one paginated page of node ids stored in one graph.
+    pub async fn list_nodes(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<Page<String>> {
+        let response = self
+            .upstream_graph
+            .list_nodes(ListNodesRequest {
+                tenant_id: tenant_id.to_string(),
+                graph: graph.to_string(),
+                page: page_request(limit, cursor)?,
+            })
+            .await
+            .context("failed to list nodes")?
+            .into_inner();
+        Ok(Page {
+            items: response.node_ids,
+            next_cursor: response.page.and_then(|page| non_empty(page.next_cursor)),
+        })
+    }
+
+    /// Load all outgoing neighbors and decode each node payload.
+    pub async fn get_outgoing_neighbor_nodes<T: DeserializeOwned>(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        node_id: &str,
+        label: &str,
+    ) -> Result<Vec<NeighborNode<T>>> {
+        self.get_neighbor_nodes(
+            tenant_id,
+            graph,
+            node_id,
+            label,
+            NeighborDirection::Outgoing,
+        )
+        .await
+    }
+
+    /// Load all incoming neighbors and decode each node payload.
+    pub async fn get_incoming_neighbor_nodes<T: DeserializeOwned>(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        node_id: &str,
+        label: &str,
+    ) -> Result<Vec<NeighborNode<T>>> {
+        self.get_neighbor_nodes(
+            tenant_id,
+            graph,
+            node_id,
+            label,
+            NeighborDirection::Incoming,
+        )
+        .await
+    }
+
+    // EN: Paginates until `next_cursor` comes back absent (or repeats the
+    // cursor we just used, as a guard against a misbehaving server looping
+    // forever) — never merely because a page was empty or shorter than
+    // `limit`. The server can legitimately hand back a short or empty page
+    // in the middle of a listing (for example an index entry surviving a
+    // deleted node) with more data still to come after it.
+    // FR: Pagine jusqu a ce que `next_cursor` soit absent (ou repete le
+    // curseur qu on vient d utiliser, en garde-fou contre un serveur qui
+    // boucle indefiniment) — jamais simplement parce qu une page est vide
+    // ou plus courte que `limit`. Le serveur peut legitimement renvoyer une
+    // page courte ou vide au milieu d un listing (par exemple une entree d
+    // index survivant a un node supprime) avec encore des donnees a venir
+    // ensuite.
+    async fn get_neighbor_nodes<T: DeserializeOwned>(
+        &mut self,
+        tenant_id: &str,
+        graph: &str,
+        node_id: &str,
+        label: &str,
+        direction: NeighborDirection,
+    ) -> Result<Vec<NeighborNode<T>>> {
+        let mut cursor = None;
+        let mut neighbors = Vec::new();
+        loop {
+            let page = match direction {
+                NeighborDirection::Outgoing => {
+                    self.neighbors_out(
+                        tenant_id,
+                        graph,
+                        node_id,
+                        label,
+                        Some(50),
+                        cursor.as_deref(),
+                    )
+                    .await?
+                }
+                NeighborDirection::Incoming => {
+                    self.neighbors_in(
+                        tenant_id,
+                        graph,
+                        node_id,
+                        label,
+                        Some(50),
+                        cursor.as_deref(),
+                    )
+                    .await?
+                }
+            };
+            neighbors.extend(page.neighbors);
+            match next_pagination_cursor(cursor.as_deref(), page.next_cursor) {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
+            }
+        }
+
+        let tenant_id = tenant_id.to_string();
+        let graph = graph.to_string();
+        stream::iter(neighbors)
+            .map(|neighbor| {
+                let tenant_id = tenant_id.clone();
+                let graph = graph.clone();
+                let mut upstream = self.upstream_graph.clone();
+                async move {
+                    let response = upstream
+                        .get_node(GetNodeRequest {
+                            tenant_id,
+                            graph,
+                            node_id: neighbor.node_id.clone(),
+                        })
+                        .await
+                        .context("failed to get neighbor node")?
+                        .into_inner();
+                    let value = serde_json::from_slice(&response.json)
+                        .context("failed to decode neighbor node json")?;
+                    Ok(NeighborNode {
+                        edge_id: neighbor.edge_id,
+                        node_id: neighbor.node_id,
+                        value,
+                    })
+                }
+            })
+            .buffered(CONCURRENT_REQUESTS)
+            .try_collect()
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_pagination_cursor;
+    use crate::{non_empty, page_request};
+
+    #[test]
+    fn pagination_uses_defaults_and_hides_empty_cursor() {
+        let page = page_request(None, None)
+            .expect("page request should not fail")
+            .expect("page should be present");
+        assert_eq!(page.limit, 20);
+        assert!(page.cursor.is_empty());
+        assert_eq!(non_empty(String::new()), None);
+        assert_eq!(non_empty("next".into()).as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn zero_limit_is_rejected() {
+        let error = page_request(Some(0), None).expect_err("limit 0 should be rejected");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn pagination_stops_when_next_cursor_is_absent() {
+        // EN: An absent next_cursor is the only real end-of-list signal,
+        // regardless of whether the page was empty or short.
+        // FR: L absence de next_cursor est le seul vrai signal de fin de
+        // liste, que la page ait ete vide ou courte ou non.
+        assert_eq!(next_pagination_cursor(None, None), None);
+        assert_eq!(next_pagination_cursor(Some("cursor-1"), None), None);
+    }
+
+    #[test]
+    fn pagination_continues_on_empty_page_with_a_fresh_cursor() {
+        // EN: This is the exact bug this pure function guards against: the
+        // server can return an empty (or short) page in the middle of a
+        // listing, still carrying a next_cursor, and pagination must keep
+        // going rather than stop just because that one page had no items.
+        // FR: C est exactement le bug contre lequel cette fonction pure
+        // protege : le serveur peut renvoyer une page vide (ou courte) au
+        // milieu d un listing, en portant quand meme un next_cursor, et la
+        // pagination doit continuer plutot que s arreter juste parce que
+        // cette page n avait aucun element.
+        assert_eq!(
+            next_pagination_cursor(None, Some("cursor-1".to_string())),
+            Some("cursor-1".to_string())
+        );
+        assert_eq!(
+            next_pagination_cursor(Some("cursor-1"), Some("cursor-2".to_string())),
+            Some("cursor-2".to_string())
+        );
+    }
+
+    #[test]
+    fn pagination_stops_on_a_repeated_cursor() {
+        // EN: Guard against an infinite loop if a misbehaving server ever
+        // echoes back the same cursor it was just given.
+        // FR: Garde-fou contre une boucle infinie si un serveur qui se
+        // comporte mal renvoie un jour le meme curseur que celui qu on
+        // vient de lui donner.
+        assert_eq!(
+            next_pagination_cursor(Some("cursor-1"), Some("cursor-1".to_string())),
+            None
+        );
+    }
+}

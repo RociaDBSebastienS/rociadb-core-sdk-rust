@@ -1,0 +1,27 @@
+[package]
+name = "rocia-db-sdk"
+version = "0.3.0"
+edition = "2024"
+description = "RociaDB-SDK"
+license = "Apache-2.0"
+exclude = ["typescript/"]
+
+[dependencies]
+anyhow = "1"
+futures = "0.3.31"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+pbjson-types = "0.8.0"
+prost = "0.14.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time"] }
+tonic = { version = "0.14.2", features = ["transport", "tls-native-roots"] }
+tonic-prost = "0.14.2"
+tracing = "0.1"
+uuid = { version = "1.19.0", features = ["v4"] }
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14.2" }
+prost-build = "0.14"
+tonic-prost = "0.14.2"
