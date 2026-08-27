@@ -61,10 +61,9 @@ use crate::pb::upstream::v1::{
     QueryOperator, QuerySort, SortDirection,
 };
 use auth::{BearerInterceptor, TokenManager, TokenRefreshGuard};
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{TryStreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use tonic::codegen::InterceptedService;
@@ -151,6 +150,58 @@ pub struct RociaDbClient {
 pub struct Page<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<String>,
+}
+
+/// EN: One page of document results, together with the total number of
+/// documents matching the request (before pagination).
+///
+/// EN: This replaces the anonymous `(Vec<T>, Option<String>, u64)` tuple
+/// [`RociaDbClient::search_documents`], [`RociaDbClient::list_documents`],
+/// and [`RociaDbClient::query_documents`] used to return: the same three
+/// values, now named `items`, `next_cursor`, and `total_count` — consistent
+/// with [`Page<T>`], which already has `items` and `next_cursor`.
+///
+/// The cost of `total_count` is **not** the same across the three methods
+/// that produce it, because the server computes it differently for each:
+/// - [`RociaDbClient::list_documents`] (`ListDoc`): free — the server keeps
+///   a running per-collection counter updated on every write, so reading it
+///   costs nothing beyond the listing itself.
+/// - [`RociaDbClient::search_documents`] (`FindByField`): a count over the
+///   matching field-index entries.
+/// - [`RociaDbClient::query_documents`] (`QueryDoc`): expensive — the server
+///   only knows the total once it has filtered the *complete* candidate set
+///   for the query, so the cost scales with the number of candidates on
+///   every single call. Do not call this in a loop expecting a cheap
+///   number; fetch it once and cache it if the same query is issued
+///   repeatedly.
+/// FR: Une page de resultats document, avec le nombre total de documents
+/// correspondant a la requete (avant pagination).
+///
+/// FR: Remplace le tuple anonyme `(Vec<T>, Option<String>, u64)` que
+/// retournaient [`RociaDbClient::search_documents`],
+/// [`RociaDbClient::list_documents`], et [`RociaDbClient::query_documents`] :
+/// les trois memes valeurs, desormais nommees `items`, `next_cursor`, et
+/// `total_count` — coherent avec [`Page<T>`], qui a deja `items` et
+/// `next_cursor`.
+///
+/// Le cout de `total_count` n est **pas** le meme selon la methode qui le
+/// produit, car le serveur le calcule differemment pour chacune :
+/// - [`RociaDbClient::list_documents`] (`ListDoc`) : gratuit — le serveur
+///   maintient un compteur par collection mis a jour a chaque ecriture, le
+///   lire ne coute rien de plus que le listing lui-meme.
+/// - [`RociaDbClient::search_documents`] (`FindByField`) : un comptage sur
+///   les entrees d index de champ correspondantes.
+/// - [`RociaDbClient::query_documents`] (`QueryDoc`) : couteux — le serveur
+///   ne connait le total qu apres avoir filtre l integralite du jeu de
+///   candidats de la requete, donc le cout croit avec le nombre de
+///   candidats a chaque appel. Ne l appelez pas en boucle en pensant obtenir
+///   un nombre gratuit ; recuperez-le une fois et mettez-le en cache si la
+///   meme requete est reemise plusieurs fois.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentPage<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub total_count: u64,
 }
 
 /// EN: Build a `PageRequest` applying the SDK default page size.
@@ -260,6 +311,157 @@ pub struct DocumentQueryFilter {
 pub struct DocumentQuerySort {
     pub field: String,
     pub direction: DocumentQuerySortDirection,
+}
+
+/// EN: One node to upsert, used by [`RociaDbClient::put_nodes`].
+///
+/// `node_id` is the **complete** node id (for example `"product:sku-1"`),
+/// not a `(label, id)` pair for the SDK to reassemble: `label:id` remains a
+/// usage convention, not something the server enforces or the SDK
+/// recomposes. This is a breaking change from the 0.4.0 batch API, which
+/// took a `HashMap<(String, String), Value>` keyed by `(label, id)` and
+/// built `node_id` internally as `format!("{label}:{id}")` — a caller that
+/// previously passed `("product", "sku-1")` now writes the node id itself:
+/// `NodeInput { node_id: "product:sku-1".to_string(), .. }`.
+/// FR: Un node a upserter, utilise par [`RociaDbClient::put_nodes`].
+///
+/// `node_id` est l id **complet** du node (par exemple `"product:sku-1"`),
+/// pas un couple `(label, id)` que le SDK recomposerait : `label:id` reste
+/// une convention d usage, pas quelque chose que le serveur impose ou que le
+/// SDK recompose. C est un changement cassant par rapport a l API batch de
+/// 0.4.0, qui prenait un `HashMap<(String, String), Value>` indexe par
+/// `(label, id)` et construisait `node_id` en interne via
+/// `format!("{label}:{id}")` — un appelant qui passait auparavant
+/// `("product", "sku-1")` ecrit desormais l id de node lui-meme :
+/// `NodeInput { node_id: "product:sku-1".to_string(), .. }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeInput {
+    pub node_id: String,
+    pub value: Value,
+    /// EN: Idempotency key for this item's `PutNode` call. When `None`, one
+    /// is generated automatically (same `upsert_node:<uuid>` format as
+    /// before this type existed). Provide it explicitly — and reuse the
+    /// same value on a retry — so a batch replayed after a timeout resumes
+    /// safely: the server deduplicates on `(tenant, operation,
+    /// request_id)`, so a repeated `request_id` is recognized as the same
+    /// write rather than a new one.
+    /// FR: Cle d idempotence pour l appel `PutNode` de cet item. Quand elle
+    /// vaut `None`, une cle est generee automatiquement (meme format
+    /// `upsert_node:<uuid>` qu avant l existence de ce type).
+    /// Fournissez-la explicitement — et reutilisez la meme valeur lors d un
+    /// rejeu — pour qu un batch rejoue apres un timeout reprenne en toute
+    /// securite : le serveur deduplique sur `(tenant, operation,
+    /// request_id)`, donc un `request_id` repete est reconnu comme la meme
+    /// ecriture plutot qu une nouvelle.
+    pub request_id: Option<String>,
+}
+
+/// EN: One edge to upsert, used by [`RociaDbClient::add_edges`].
+///
+/// `edge_id` is raw and must not be prefixed with `label`.
+/// FR: Un edge a upserter, utilise par [`RociaDbClient::add_edges`].
+///
+/// `edge_id` est brut et ne doit pas etre prefixe par `label`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeInput {
+    pub edge_id: String,
+    pub from: String,
+    pub to: String,
+    pub label: String,
+    pub value: Value,
+    /// EN: Idempotency key for this item's `AddEdge` call. When `None`, one
+    /// is generated automatically (a bare UUID, same as before this type
+    /// existed, with no prefix). See [`NodeInput::request_id`] for why
+    /// reusing it on a retry matters.
+    /// FR: Cle d idempotence pour l appel `AddEdge` de cet item. Quand elle
+    /// vaut `None`, une cle est generee automatiquement (un UUID brut, comme
+    /// avant l existence de ce type, sans prefixe). Voir
+    /// [`NodeInput::request_id`] pour l importance de la reutiliser lors d
+    /// un rejeu.
+    pub request_id: Option<String>,
+}
+
+/// EN: Build the ordered `PutNodeRequest` batch for
+/// [`RociaDbClient::put_nodes`]. Pulled out as a pure, network-free
+/// function — the same way [`crate::file::chunk_upload_requests`] is for
+/// uploads — so the batch's wire shape is unit-testable without a live
+/// client: item order is preserved (`nodes` is consumed via `into_iter` in
+/// the order given), duplicate `node_id`s are not merged (each `NodeInput`
+/// becomes exactly one `PutNodeRequest`), and `request_id` is passed
+/// through unchanged or defaulted to `upsert_node:<uuid>` when absent.
+/// FR: Construit le batch `PutNodeRequest` ordonne pour
+/// [`RociaDbClient::put_nodes`]. Extraite en fonction pure, sans reseau —
+/// comme [`crate::file::chunk_upload_requests`] pour les uploads — pour que
+/// la forme sur le fil du batch soit testable unitairement sans client
+/// reel : l ordre des items est preserve (`nodes` est consomme via
+/// `into_iter` dans l ordre fourni), les `node_id` dupliques ne sont pas
+/// fusionnes (chaque `NodeInput` devient exactement un `PutNodeRequest`),
+/// et `request_id` est transmis tel quel ou vaut par defaut
+/// `upsert_node:<uuid>` quand il est absent.
+fn build_put_node_requests(
+    tenant_id: &str,
+    graph_name: &str,
+    nodes: Vec<NodeInput>,
+) -> Result<Vec<PutNodeRequest>> {
+    nodes
+        .into_iter()
+        .map(|node| {
+            let json = serde_json::to_vec(&node.value).encode_context("node json")?;
+            Ok(PutNodeRequest {
+                tenant_id: tenant_id.to_string(),
+                graph: graph_name.to_string(),
+                node_id: node.node_id,
+                json,
+                request_id: node
+                    .request_id
+                    .unwrap_or_else(|| format!("upsert_node:{}", Uuid::new_v4())),
+            })
+        })
+        .collect()
+}
+
+/// EN: Build the ordered `AddEdgeRequest` batch for
+/// [`RociaDbClient::add_edges`]. Same rationale and guarantees as
+/// [`build_put_node_requests`]: order preserved, duplicate `edge_id`s not
+/// merged, `request_id` passed through unchanged or defaulted to a bare
+/// UUID (no prefix) when absent.
+/// FR: Construit le batch `AddEdgeRequest` ordonne pour
+/// [`RociaDbClient::add_edges`]. Meme logique et memes garanties que
+/// [`build_put_node_requests`] : ordre preserve, `edge_id` dupliques non
+/// fusionnes, `request_id` transmis tel quel ou par defaut un UUID brut
+/// (sans prefixe) quand il est absent.
+fn build_add_edge_requests(
+    tenant_id: &str,
+    graph_name: &str,
+    edges: Vec<EdgeInput>,
+) -> Result<Vec<AddEdgeRequest>> {
+    edges
+        .into_iter()
+        .map(|edge| {
+            let json = serde_json::to_vec(&edge.value).encode_context("edge json")?;
+            debug!(
+                tenant_id = tenant_id,
+                graph = graph_name,
+                edge_id = edge.edge_id,
+                from = edge.from,
+                to = edge.to,
+                label = edge.label,
+                "prepared graph edge upsert"
+            );
+            Ok(AddEdgeRequest {
+                tenant_id: tenant_id.to_string(),
+                graph: graph_name.to_string(),
+                edge_id: edge.edge_id,
+                from: edge.from,
+                to: edge.to,
+                label: edge.label,
+                json,
+                request_id: edge
+                    .request_id
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            })
+        })
+        .collect()
 }
 
 impl Default for RociaDbBuilder {
@@ -647,6 +849,20 @@ impl RociaDbClient {
         Ok(())
     }
 
+    /// EN: Find documents whose `search_field` equals `value` (`FindByField`).
+    ///
+    /// EN: `total_count` on the returned [`DocumentPage`] is a count over
+    /// the matching field-index entries — see [`DocumentPage`] for how this
+    /// compares to [`RociaDbClient::list_documents`] and
+    /// [`RociaDbClient::query_documents`].
+    /// FR: Cherche les documents dont `search_field` vaut `value`
+    /// (`FindByField`).
+    ///
+    /// FR: `total_count` sur le [`DocumentPage`] retourne est un comptage
+    /// sur les entrees d index de champ correspondantes — voir
+    /// [`DocumentPage`] pour la comparaison avec
+    /// [`RociaDbClient::list_documents`] et
+    /// [`RociaDbClient::query_documents`].
     pub async fn search_documents<T>(
         &self,
         tenant_id: &str,
@@ -655,7 +871,7 @@ impl RociaDbClient {
         value: &impl Serialize,
         limit: Option<u32>,
         cursor: Option<&str>,
-    ) -> Result<(Vec<T>, Option<String>, u64)>
+    ) -> Result<DocumentPage<T>>
     where
         T: DeserializeOwned,
     {
@@ -732,16 +948,38 @@ impl RociaDbClient {
             "document search completed"
         );
 
-        Ok((resp, next_cursor, result.total_count))
+        Ok(DocumentPage {
+            items: resp,
+            next_cursor,
+            total_count: result.total_count,
+        })
     }
 
+    /// EN: Return one paginated page of every document in `collection_name`
+    /// (`ListDoc`).
+    ///
+    /// EN: `total_count` on the returned [`DocumentPage`] is **free**: the
+    /// server keeps a running per-collection counter updated on every
+    /// write, so reading it costs nothing beyond the listing itself — see
+    /// [`DocumentPage`] for how this compares to
+    /// [`RociaDbClient::search_documents`] and
+    /// [`RociaDbClient::query_documents`].
+    /// FR: Retourne une page paginee de tous les documents de
+    /// `collection_name` (`ListDoc`).
+    ///
+    /// FR: `total_count` sur le [`DocumentPage`] retourne est **gratuit** :
+    /// le serveur maintient un compteur par collection mis a jour a chaque
+    /// ecriture, le lire ne coute rien de plus que le listing lui-meme —
+    /// voir [`DocumentPage`] pour la comparaison avec
+    /// [`RociaDbClient::search_documents`] et
+    /// [`RociaDbClient::query_documents`].
     pub async fn list_documents<T>(
         &self,
         tenant_id: &str,
         collection_name: &str,
         limit: Option<u32>,
         cursor: Option<&str>,
-    ) -> Result<(Vec<T>, Option<String>, u64)>
+    ) -> Result<DocumentPage<T>>
     where
         T: DeserializeOwned,
     {
@@ -799,7 +1037,11 @@ impl RociaDbClient {
             "document listing completed"
         );
 
-        Ok((resp, next_cursor, result.total_count))
+        Ok(DocumentPage {
+            items: resp,
+            next_cursor,
+            total_count: result.total_count,
+        })
     }
 
     /// EN: List the document collections holding at least one document.
@@ -859,9 +1101,25 @@ impl RociaDbClient {
     /// EN: The underlying server applies filters with logical AND and
     /// uses the provided sort list in order. The returned `next_cursor`
     /// is an opaque server cursor that should be fed back unchanged.
+    ///
+    /// EN: `total_count` on the returned [`DocumentPage`] is **expensive**:
+    /// the server only knows it after filtering the complete candidate set
+    /// for the query, so the cost scales with the number of candidates on
+    /// every call — never call this in a loop just to get a count; see
+    /// [`DocumentPage`] for the full comparison with
+    /// [`RociaDbClient::list_documents`] and
+    /// [`RociaDbClient::search_documents`].
     /// FR: Le serveur applique les filtres avec un ET logique et utilise
     /// la liste de tri dans l ordre fourni. Le `next_cursor` retourne est
     /// opaque et doit etre reutilise tel quel.
+    ///
+    /// FR: `total_count` sur le [`DocumentPage`] retourne est **couteux** :
+    /// le serveur ne le connait qu apres avoir filtre l integralite du jeu
+    /// de candidats de la requete, donc le cout croit avec le nombre de
+    /// candidats a chaque appel — ne l appelez jamais en boucle juste pour
+    /// obtenir un compte ; voir [`DocumentPage`] pour la comparaison
+    /// complete avec [`RociaDbClient::list_documents`] et
+    /// [`RociaDbClient::search_documents`].
     pub async fn query_documents<T>(
         &self,
         tenant_id: &str,
@@ -870,7 +1128,7 @@ impl RociaDbClient {
         sort: &[DocumentQuerySort],
         limit: Option<u32>,
         cursor: Option<&str>,
-    ) -> Result<(Vec<T>, Option<String>, u64)>
+    ) -> Result<DocumentPage<T>>
     where
         T: DeserializeOwned,
     {
@@ -967,7 +1225,11 @@ impl RociaDbClient {
             "document query completed"
         );
 
-        Ok((resp, next_cursor, result.total_count))
+        Ok(DocumentPage {
+            items: resp,
+            next_cursor,
+            total_count: result.total_count,
+        })
     }
 
     pub async fn get_document<T>(
@@ -1026,47 +1288,56 @@ impl RociaDbClient {
         Ok(resp)
     }
 
-    /// EN: Upsert a batch of nodes in a graph with bounded concurrency.
-    /// FR: Upsert un batch de nodes dans un graph avec concurrence bornee.
+    /// EN: Upsert a batch of nodes in a graph with bounded concurrency (at
+    /// most 10 `PutNode` calls in flight at once). `nodes` is consumed in
+    /// the order the caller provides — duplicate
+    /// `node_id`s are **not** merged, both are sent, in order.
     ///
     /// EN: Arguments:
     /// - `tenant_id`: Tenant identifier.
     /// - `graph_name`: Graph name.
-    /// - `data`: Map of `(label, id)` to JSON payload.
+    /// - `nodes`: Ordered [`NodeInput`] items to upsert.
     /// FR: Arguments:
     /// - `tenant_id`: Identifiant du tenant.
     /// - `graph_name`: Nom du graph.
-    /// - `data`: Map `(label, id)` vers payload JSON.
+    /// - `nodes`: Items [`NodeInput`] ordonnes a upserter.
     ///
     /// EN: Returns:
     /// - `()` on success.
     /// FR: Returns:
     /// - `()` en cas de succes.
+    ///
+    /// EN: **This batch is not atomic and stops at the first error**: on
+    /// failure, in-flight requests are cancelled and the error does not say
+    /// which items had already succeeded. To resume after a failure, replay
+    /// the same `nodes` sequence with the same [`NodeInput::request_id`]
+    /// values you used the first time — the server deduplicates on
+    /// `(tenant, operation, request_id)`, so already-applied writes are
+    /// recognized and skipped rather than reapplied, and only the writes
+    /// that never landed actually happen.
+    /// FR: **Ce batch n est pas atomique et s arrete a la premiere erreur**
+    /// : en cas d echec, les requetes en vol sont annulees et l erreur ne
+    /// dit pas quels items avaient deja abouti. Pour reprendre apres un
+    /// echec, rejouez la meme sequence `nodes` avec les memes valeurs de
+    /// [`NodeInput::request_id`] que la premiere fois — le serveur
+    /// deduplique sur `(tenant, operation, request_id)`, donc les ecritures
+    /// deja appliquees sont reconnues et ignorees plutot que reappliquees,
+    /// et seules celles qui n avaient pas abouti se produisent reellement.
     pub async fn put_nodes(
         &self,
         tenant_id: &str,
         graph_name: &str,
-        data: HashMap<(String, String), Value>,
+        nodes: impl IntoIterator<Item = NodeInput>,
     ) -> Result<()> {
-        let tenant_id = tenant_id.to_string();
-        let graph_name = graph_name.to_string();
+        let nodes: Vec<NodeInput> = nodes.into_iter().collect();
         debug!(
             tenant_id = tenant_id,
             graph = graph_name,
-            node_count = data.len(),
+            node_count = nodes.len(),
             "upserting graph nodes batch"
         );
-        stream::iter(data)
-            .map(|((label, id), value)| {
-                let json = serde_json::to_vec(&value).encode_context("node json")?;
-                Ok::<PutNodeRequest, RociaDbError>(PutNodeRequest {
-                    tenant_id: tenant_id.clone(),
-                    graph: graph_name.clone(),
-                    node_id: format!("{}:{}", label, id),
-                    json,
-                    request_id: format!("upsert_node:{}", Uuid::new_v4()),
-                })
-            })
+        let requests = build_put_node_requests(tenant_id, graph_name, nodes)?;
+        stream::iter(requests.into_iter().map(Ok::<_, RociaDbError>))
             .try_for_each_concurrent(CONCURRENT_REQUESTS, |node| {
                 let mut upstream = self.upstream_graph.clone();
                 async move {
@@ -1164,17 +1435,19 @@ impl RociaDbClient {
         Ok(value)
     }
 
-    /// EN: Upsert a batch of edges with bounded concurrency.
-    /// FR: Upsert un batch d edges avec concurrence bornee.
+    /// EN: Upsert a batch of edges with bounded concurrency (at most 10
+    /// `AddEdge` calls in flight at once). `edges` is consumed in the order
+    /// the caller provides — duplicate `edge_id`s are **not** merged, both
+    /// are sent, in order.
     ///
     /// EN: Arguments:
     /// - `tenant_id`: Tenant identifier.
     /// - `graph_name`: Graph name.
-    /// - `data`: Map of `(from, to, label, edge_id)` to JSON payload.
+    /// - `edges`: Ordered [`EdgeInput`] items to upsert.
     /// FR: Arguments:
     /// - `tenant_id`: Identifiant du tenant.
     /// - `graph_name`: Nom du graph.
-    /// - `data`: Map `(from, to, label, edge_id_brut)` vers payload JSON.
+    /// - `edges`: Items [`EdgeInput`] ordonnes a upserter.
     ///
     /// EN: Returns:
     /// - `()` on success.
@@ -1187,45 +1460,38 @@ impl RociaDbClient {
     /// FR: Le serveur renvoie `NOT_FOUND` pour toute edge dont le node
     /// `from` ou `to` n existe pas deja dans `graph_name` : creez les deux
     /// nodes aux extremites avant d ajouter une edge entre eux.
+    ///
+    /// EN: **This batch is not atomic and stops at the first error**: on
+    /// failure, in-flight requests are cancelled and the error does not say
+    /// which items had already succeeded. To resume after a failure, replay
+    /// the same `edges` sequence with the same [`EdgeInput::request_id`]
+    /// values you used the first time — the server deduplicates on
+    /// `(tenant, operation, request_id)`, so already-applied writes are
+    /// recognized and skipped rather than reapplied, and only the writes
+    /// that never landed actually happen.
+    /// FR: **Ce batch n est pas atomique et s arrete a la premiere erreur**
+    /// : en cas d echec, les requetes en vol sont annulees et l erreur ne
+    /// dit pas quels items avaient deja abouti. Pour reprendre apres un
+    /// echec, rejouez la meme sequence `edges` avec les memes valeurs de
+    /// [`EdgeInput::request_id`] que la premiere fois — le serveur
+    /// deduplique sur `(tenant, operation, request_id)`, donc les ecritures
+    /// deja appliquees sont reconnues et ignorees plutot que reappliquees,
+    /// et seules celles qui n avaient pas abouti se produisent reellement.
     pub async fn add_edges(
         &self,
         tenant_id: &str,
         graph_name: &str,
-        edges: HashMap<(String, String, String, String), Value>,
+        edges: impl IntoIterator<Item = EdgeInput>,
     ) -> Result<()> {
-        let tenant_id = tenant_id.to_string();
-        let graph_name = graph_name.to_string();
+        let edges: Vec<EdgeInput> = edges.into_iter().collect();
         debug!(
             tenant_id = tenant_id,
             graph = graph_name,
             edge_count = edges.len(),
             "upserting graph edges batch"
         );
-        stream::iter(edges)
-            .map(|((from, to, label, id), data)| {
-                let json = serde_json::to_vec(&data).encode_context("edge json")?;
-                let edge_id = id;
-                debug!(
-                    tenant_id = tenant_id,
-                    graph = graph_name,
-                    edge_id = edge_id,
-                    from = from,
-                    to = to,
-                    label = label,
-                    "prepared graph edge upsert"
-                );
-
-                Ok::<AddEdgeRequest, RociaDbError>(AddEdgeRequest {
-                    tenant_id: tenant_id.clone(),
-                    graph: graph_name.clone(),
-                    edge_id,
-                    from,
-                    to,
-                    label,
-                    json,
-                    request_id: Uuid::new_v4().to_string(),
-                })
-            })
+        let requests = build_add_edge_requests(tenant_id, graph_name, edges)?;
+        stream::iter(requests.into_iter().map(Ok::<_, RociaDbError>))
             .try_for_each_concurrent(CONCURRENT_REQUESTS, |edge| {
                 let mut upstream = self.upstream_graph.clone();
                 async move {
@@ -1310,7 +1576,10 @@ impl RociaDbClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{RociaDbClient, validate_node_binding};
+    use super::{
+        DocumentPage, EdgeInput, NodeInput, RociaDbClient, build_add_edge_requests,
+        build_put_node_requests, validate_node_binding,
+    };
     use crate::RociaDbError;
 
     #[test]
@@ -1368,5 +1637,318 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RociaDbClient>();
         assert_send_sync::<std::sync::Arc<RociaDbClient>>();
+    }
+
+    // EN: `build_put_node_requests` / `build_add_edge_requests` are the pure,
+    // network-free cores of `RociaDbClient::put_nodes` /
+    // `RociaDbClient::add_edges` (see their doc comments) — extracted for
+    // exactly this reason: the 0.4.0 -> 0.5.0 rework replaced a
+    // `HashMap`-keyed batch input with an ordered `Vec<NodeInput>` /
+    // `Vec<EdgeInput>` precisely because a `HashMap` neither preserves
+    // caller order nor keeps duplicate keys, and silently generated one
+    // idempotency key per batch instead of one per item. These tests lock
+    // in the three properties that motivated the change.
+    // FR: `build_put_node_requests` / `build_add_edge_requests` sont les
+    // coeurs purs, sans reseau, de `RociaDbClient::put_nodes` /
+    // `RociaDbClient::add_edges` (voir leurs doc comments) — extraites
+    // exactement pour cette raison : le passage de 0.4.0 a 0.5.0 a remplace
+    // une entree de batch indexee par `HashMap` par un `Vec<NodeInput>` /
+    // `Vec<EdgeInput>` ordonne, precisement parce qu une `HashMap` ne
+    // preserve ni l ordre de l appelant ni les cles dupliquees, et generait
+    // silencieusement une seule cle d idempotence pour tout le batch au
+    // lieu d une par item. Ces tests verrouillent les trois proprietes qui
+    // ont motive ce changement.
+
+    #[test]
+    fn put_node_requests_preserve_caller_order() {
+        // EN: This is precisely what a `HashMap<(String, String), Value>`
+        // could not guarantee — iteration order over a hash map is
+        // unspecified, so the pre-0.5.0 batch could silently reorder
+        // `PutNode` calls relative to what the caller wrote.
+        // FR: C est precisement ce qu une `HashMap<(String, String), Value>`
+        // ne pouvait pas garantir — l ordre d iteration d une hash map
+        // n est pas specifie, donc le batch pre-0.5.0 pouvait reordonner
+        // silencieusement les appels `PutNode` par rapport a ce que
+        // l appelant avait ecrit.
+        let nodes = vec![
+            NodeInput {
+                node_id: "product:3".to_string(),
+                value: serde_json::json!({"n": 3}),
+                request_id: None,
+            },
+            NodeInput {
+                node_id: "product:1".to_string(),
+                value: serde_json::json!({"n": 1}),
+                request_id: None,
+            },
+            NodeInput {
+                node_id: "product:2".to_string(),
+                value: serde_json::json!({"n": 2}),
+                request_id: None,
+            },
+        ];
+        let requests =
+            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
+        let ids: Vec<&str> = requests.iter().map(|r| r.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["product:3", "product:1", "product:2"]);
+    }
+
+    #[test]
+    fn put_node_requests_do_not_merge_duplicate_node_ids() {
+        let nodes = vec![
+            NodeInput {
+                node_id: "product:1".to_string(),
+                value: serde_json::json!({"n": 1}),
+                request_id: None,
+            },
+            NodeInput {
+                node_id: "product:1".to_string(),
+                value: serde_json::json!({"n": 2}),
+                request_id: None,
+            },
+        ];
+        let requests =
+            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
+        assert_eq!(
+            requests.len(),
+            2,
+            "a HashMap keyed by node_id would have collapsed this to one request"
+        );
+        assert_eq!(requests[0].node_id, "product:1");
+        assert_eq!(requests[1].node_id, "product:1");
+        assert_ne!(
+            requests[0].json, requests[1].json,
+            "each duplicate keeps its own payload"
+        );
+    }
+
+    #[test]
+    fn put_node_requests_use_node_id_verbatim_with_no_label_recomposition() {
+        // EN: 0.4.0 took a `(label, id)` pair and built `node_id` internally
+        // as `format!("{label}:{id}")`. 0.5.0 takes the complete node id and
+        // must forward it unchanged.
+        // FR: 0.4.0 prenait un couple `(label, id)` et construisait
+        // `node_id` en interne via `format!("{label}:{id}")`. 0.5.0 prend
+        // l id complet du node et doit le transmettre tel quel.
+        let nodes = vec![NodeInput {
+            node_id: "product:sku-1".to_string(),
+            value: serde_json::json!({}),
+            request_id: None,
+        }];
+        let requests =
+            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
+        assert_eq!(requests[0].node_id, "product:sku-1");
+    }
+
+    #[test]
+    fn put_node_requests_pass_through_caller_supplied_request_id() {
+        let nodes = vec![NodeInput {
+            node_id: "product:1".to_string(),
+            value: serde_json::json!({}),
+            request_id: Some("caller-chosen-id".to_string()),
+        }];
+        let requests =
+            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
+        assert_eq!(requests[0].request_id, "caller-chosen-id");
+    }
+
+    #[test]
+    fn put_node_requests_default_request_id_keeps_the_pre_0_5_0_prefix() {
+        // EN: This is the idempotency-hole fix: before `NodeInput` existed,
+        // an absent id was generated as `upsert_node:<uuid>`. A caller
+        // relying on that exact prefix (for log filtering, for example)
+        // must see it unchanged.
+        // FR: C est le correctif du trou d idempotence : avant l existence
+        // de `NodeInput`, un id absent etait genere en
+        // `upsert_node:<uuid>`. Un appelant qui se fie a ce prefixe exact
+        // (pour du filtrage de logs, par exemple) doit le voir inchange.
+        let nodes = vec![
+            NodeInput {
+                node_id: "product:1".to_string(),
+                value: serde_json::json!({}),
+                request_id: None,
+            },
+            NodeInput {
+                node_id: "product:2".to_string(),
+                value: serde_json::json!({}),
+                request_id: None,
+            },
+        ];
+        let requests =
+            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
+        for request in &requests {
+            let uuid_part = request
+                .request_id
+                .strip_prefix("upsert_node:")
+                .expect("default request_id must keep the upsert_node: prefix");
+            uuid::Uuid::parse_str(uuid_part).expect("suffix after the prefix must be a uuid");
+        }
+        assert_ne!(
+            requests[0].request_id, requests[1].request_id,
+            "each item without an explicit request_id must get its own generated id"
+        );
+    }
+
+    #[test]
+    fn add_edge_requests_preserve_caller_order() {
+        let edges = vec![
+            EdgeInput {
+                edge_id: "e3".to_string(),
+                from: "a".to_string(),
+                to: "b".to_string(),
+                label: "knows".to_string(),
+                value: serde_json::json!({}),
+                request_id: None,
+            },
+            EdgeInput {
+                edge_id: "e1".to_string(),
+                from: "b".to_string(),
+                to: "c".to_string(),
+                label: "knows".to_string(),
+                value: serde_json::json!({}),
+                request_id: None,
+            },
+            EdgeInput {
+                edge_id: "e2".to_string(),
+                from: "c".to_string(),
+                to: "d".to_string(),
+                label: "knows".to_string(),
+                value: serde_json::json!({}),
+                request_id: None,
+            },
+        ];
+        let requests =
+            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
+        let ids: Vec<&str> = requests.iter().map(|r| r.edge_id.as_str()).collect();
+        assert_eq!(ids, vec!["e3", "e1", "e2"]);
+    }
+
+    #[test]
+    fn add_edge_requests_do_not_merge_duplicate_edge_ids() {
+        let edges = vec![
+            EdgeInput {
+                edge_id: "e1".to_string(),
+                from: "a".to_string(),
+                to: "b".to_string(),
+                label: "knows".to_string(),
+                value: serde_json::json!({"v": 1}),
+                request_id: None,
+            },
+            EdgeInput {
+                edge_id: "e1".to_string(),
+                from: "a".to_string(),
+                to: "b".to_string(),
+                label: "knows".to_string(),
+                value: serde_json::json!({"v": 2}),
+                request_id: None,
+            },
+        ];
+        let requests =
+            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
+        assert_eq!(
+            requests.len(),
+            2,
+            "a HashMap keyed by edge_id would have collapsed this to one request"
+        );
+        assert_ne!(
+            requests[0].json, requests[1].json,
+            "each duplicate keeps its own payload"
+        );
+    }
+
+    #[test]
+    fn add_edge_requests_pass_through_caller_supplied_request_id() {
+        let edges = vec![EdgeInput {
+            edge_id: "e1".to_string(),
+            from: "a".to_string(),
+            to: "b".to_string(),
+            label: "knows".to_string(),
+            value: serde_json::json!({}),
+            request_id: Some("caller-chosen-id".to_string()),
+        }];
+        let requests =
+            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
+        assert_eq!(requests[0].request_id, "caller-chosen-id");
+    }
+
+    #[test]
+    fn add_edge_requests_default_request_id_stays_a_bare_uuid() {
+        // EN: Unlike nodes, the pre-0.5.0 default for edges had no prefix
+        // (a bare `Uuid::new_v4().to_string()`) — must stay that way.
+        // FR: Contrairement aux nodes, le defaut pre-0.5.0 pour les edges
+        // n avait pas de prefixe (un `Uuid::new_v4().to_string()` brut) —
+        // doit le rester.
+        let edges = vec![
+            EdgeInput {
+                edge_id: "e1".to_string(),
+                from: "a".to_string(),
+                to: "b".to_string(),
+                label: "knows".to_string(),
+                value: serde_json::json!({}),
+                request_id: None,
+            },
+            EdgeInput {
+                edge_id: "e2".to_string(),
+                from: "b".to_string(),
+                to: "c".to_string(),
+                label: "knows".to_string(),
+                value: serde_json::json!({}),
+                request_id: None,
+            },
+        ];
+        let requests =
+            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
+        for request in &requests {
+            uuid::Uuid::parse_str(&request.request_id)
+                .expect("default request_id must be a bare uuid with no prefix");
+        }
+        assert_ne!(
+            requests[0].request_id, requests[1].request_id,
+            "each item without an explicit request_id must get its own generated id"
+        );
+    }
+
+    #[test]
+    fn document_page_exposes_items_next_cursor_and_total_count() {
+        let page = DocumentPage {
+            items: vec!["a", "b"],
+            next_cursor: Some("cursor-2".to_string()),
+            total_count: 42,
+        };
+        assert_eq!(page.items, vec!["a", "b"]);
+        assert_eq!(page.next_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(page.total_count, 42);
+    }
+
+    #[test]
+    fn document_page_has_no_next_cursor_on_the_last_page() {
+        // EN: `next_cursor: None` is the only correct representation of
+        // "there is no further page" — see the type's doc comment.
+        // FR: `next_cursor: None` est la seule representation correcte de
+        // "il n y a pas de page suivante" — voir le doc comment du type.
+        let page: DocumentPage<i32> = DocumentPage {
+            items: vec![1, 2, 3],
+            next_cursor: None,
+            total_count: 3,
+        };
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.items, vec![1, 2, 3]);
+        assert_eq!(page.total_count, 3);
+    }
+
+    #[test]
+    fn document_page_derives_clone_and_equality() {
+        let page = DocumentPage {
+            items: vec![1],
+            next_cursor: None,
+            total_count: 1,
+        };
+        assert_eq!(page.clone(), page);
+        let different = DocumentPage {
+            items: vec![1],
+            next_cursor: None,
+            total_count: 2,
+        };
+        assert_ne!(page, different);
     }
 }

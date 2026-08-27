@@ -240,27 +240,66 @@ echouent immediatement, generalement avec `UNAVAILABLE`.
 ## Batch Operations
 
 EN: The client uses a bounded concurrency of 10 for batch upserts.
+`put_nodes` and `add_edges` each take an ordered sequence of
+`NodeInput`/`EdgeInput` structs — anything `IntoIterator<Item =
+NodeInput>` / `IntoIterator<Item = EdgeInput>`, a `Vec` in the common case —
+not a `HashMap`: items are dispatched in the order given, and two items
+sharing the same id are never silently merged into one, both are sent.
 FR: Le client utilise une concurrence bornee de 10 pour les batchs.
+`put_nodes` et `add_edges` prennent chacun une sequence ordonnee de structs
+`NodeInput`/`EdgeInput` — n importe quel `IntoIterator<Item =
+NodeInput>` / `IntoIterator<Item = EdgeInput>`, un `Vec` dans le cas courant
+— pas une `HashMap` : les items sont envoyes dans l ordre fourni, et deux
+items partageant le meme id ne sont jamais fusionnes silencieusement, les
+deux sont envoyes.
 
 ```rust
-use std::collections::HashMap;
+use rocia_db_sdk::{EdgeInput, NodeInput};
 use serde_json::json;
 
-let mut nodes = HashMap::new();
-nodes.insert(("product".to_string(), "sku-1".to_string()), json!({"sku": "sku-1"}));
-nodes.insert(("product".to_string(), "sku-2".to_string()), json!({"sku": "sku-2"}));
+let nodes = vec![
+    NodeInput {
+        node_id: "product:sku-1".to_string(),
+        value: json!({"sku": "sku-1"}),
+        request_id: None,
+    },
+    NodeInput {
+        node_id: "product:sku-2".to_string(),
+        value: json!({"sku": "sku-2"}),
+        request_id: None,
+    },
+];
 client.put_nodes("tenant-1", "products", nodes).await?;
 
-let mut edges = HashMap::new();
-edges.insert(
-    ("product:sku-1".to_string(), "group:grp-1".to_string(), "belongs_to".to_string(), "1".to_string()),
-    json!({"weight": 1}),
-);
+let edges = vec![EdgeInput {
+    edge_id: "1".to_string(),
+    from: "product:sku-1".to_string(),
+    to: "group:grp-1".to_string(),
+    label: "belongs_to".to_string(),
+    value: json!({"weight": 1}),
+    request_id: None,
+}];
 client.add_edges("tenant-1", "products", edges).await?;
 ```
 
-EN: The edge id is raw and must not be prefixed with the label.
-FR: L id d edge est brut et ne doit pas etre prefixe par le label.
+EN: `node_id` is the **complete** node id (`"product:sku-1"`) — the SDK
+never recomposes it from a `(label, id)` pair, so build the full id
+yourself. The edge id is raw and must not be prefixed with the label.
+FR: `node_id` est l id **complet** du node (`"product:sku-1"`) — le SDK ne
+le recompose jamais a partir d un couple `(label, id)`, donc construisez
+l id complet vous-meme. L id d edge est brut et ne doit pas etre prefixe par
+le label.
+
+EN: `request_id: None` above lets the SDK generate a fresh idempotency key
+for that item. Set it explicitly — and reuse the same value on a retry —
+whenever a batch might need to be replayed; see
+[Migrating to 0.5.0](#migrating-to-050) for why that matters and what it
+looks like.
+FR: `request_id: None` ci-dessus laisse le SDK generer une cle d idempotence
+fraiche pour cet item. Fixez-la explicitement — et reutilisez la meme
+valeur lors d un rejeu — des qu un batch peut avoir besoin d etre rejoue ;
+voir [Migrating to 0.5.0](#migrating-to-050) pour comprendre pourquoi et a
+quoi cela ressemble.
 
 EN: `add_edges` (and `add_edge`) fail with `NOT_FOUND` for any edge whose
 `from` or `to` node does not already exist in the graph — create both
@@ -270,6 +309,22 @@ FR: `add_edges` (et `add_edge`) echouent avec `NOT_FOUND` pour toute edge
 dont le node `from` ou `to` n existe pas deja dans le graph — creez les deux
 nodes aux extremites (via `put_nodes`/`put_node`) avant d ajouter des edges
 entre eux.
+
+EN: **Neither batch is atomic: each stops at the first error.** In-flight
+requests are cancelled, and the error does not say which items had already
+succeeded. The correct way to resume is to replay the same items with the
+same `request_id` values used on the first attempt — the server
+deduplicates on `(tenant, operation, request_id)`, so already-applied
+writes are recognized and skipped rather than reapplied, and only the
+writes that never landed actually happen.
+FR: **Aucun des deux batchs n est atomique : chacun s arrete a la premiere
+erreur.** Les requetes en vol sont annulees, et l erreur ne dit pas quels
+items avaient deja abouti. La bonne facon de reprendre est de rejouer les
+memes items avec les memes valeurs de `request_id` que la premiere fois —
+le serveur deduplique sur `(tenant, operation, request_id)`, donc les
+ecritures deja appliquees sont reconnues et ignorees plutot que
+reappliquees, et seules celles qui n avaient pas abouti se produisent
+reellement.
 
 ## Neighbors
 
@@ -581,11 +636,37 @@ le meme comportement. `get_node` reste une methode pratique retournant
 
 EN: Mutating helpers generate a unique `request_id` by default. Use the corresponding
 `*_with_request_id` method when retries must reuse a stable idempotency key. Batch
-operations generate one key per item.
+operations generate one key per item, via `NodeInput::request_id` /
+`EdgeInput::request_id` — `None` to auto-generate, `Some(..)` to control it
+yourself.
 FR: Les helpers de mutation generent un `request_id` unique par defaut.
 Utilisez la methode `*_with_request_id` correspondante quand les retries
 doivent reutiliser une cle d idempotence stable. Les operations batch
-generent une cle par element.
+generent une cle par element, via `NodeInput::request_id` /
+`EdgeInput::request_id` — `None` pour generer automatiquement, `Some(..)`
+pour la controler vous-meme.
+
+EN: Every listing method returns a named struct, never a bare tuple:
+[`Page<T>`](#pagination) (`items`, `next_cursor`) when there is no total to
+report, and [`DocumentPage<T>`](#pagination) (`items`, `next_cursor`,
+`total_count`) for the three document-query methods that also report how
+many results matched overall — `search_documents`, `list_documents`, and
+`query_documents`. The one exception is naming, not shape: `neighbors_out`/
+`neighbors_in` return `NeighborPage`, the same `next_cursor`-terminated page
+but with the field named `neighbors` instead of `items`, since it carries
+raw `Neighbor` records rather than a generic `T` — see
+[Neighbors](#neighbors).
+FR: Chaque methode de listing retourne une struct nommee, jamais un tuple
+nu : [`Page<T>`](#pagination) (`items`, `next_cursor`) quand il n y a pas de
+total a rapporter, et [`DocumentPage<T>`](#pagination) (`items`,
+`next_cursor`, `total_count`) pour les trois methodes de requete document
+qui rapportent aussi le nombre total de resultats correspondants —
+`search_documents`, `list_documents`, et `query_documents`. La seule
+exception est dans le nom, pas dans la forme : `neighbors_out`/
+`neighbors_in` retournent `NeighborPage`, la meme page terminee par
+`next_cursor` mais avec le champ nomme `neighbors` au lieu d `items`,
+puisqu elle porte des `Neighbor` bruts plutot qu un `T` generique — voir
+[Neighbors](#neighbors).
 
 EN: Idempotency is scoped to `(tenant, operation, request_id)`: the same
 `request_id` reused across two *different* operations (a `put_document`
@@ -658,6 +739,189 @@ dans une signature de methode publique sont reexportes individuellement a
 la racine du crate a la place : `CollectionInfo`, `StatResponse`,
 `Neighbor`, `UploadRequest`, `DownloadResponse`. Dependez de ces
 reexports, pas de chemins qui plongent directement dans `pb`.
+
+## Migrating to 0.5.0
+
+EN: 0.5.0 unifies three call shapes in the public API — the document-query
+return type, the graph batch input type, and what a node id means inside
+that batch — with **no change to any observable server behavior**: the
+number, order, and content of every RPC sent to the server are identical to
+0.4.0. Four changes to audit call sites for:
+FR: La 0.5.0 uniformise trois formes d appel de l API publique — le type de
+retour des requetes document, le type d entree des batchs graph, et ce que
+signifie un node id a l interieur de ce batch — **sans aucun changement de
+comportement observable cote serveur** : le nombre, l ordre et le contenu
+de chaque RPC envoye au serveur sont identiques a la 0.4.0. Quatre
+changements a auditer dans vos points d appel :
+
+1. **`search_documents`, `list_documents`, and `query_documents` now return
+   [`DocumentPage<T>`](#pagination) instead of the anonymous
+   `(Vec<T>, Option<String>, u64)` tuple.** The same three values are now
+   named fields — `items`, `next_cursor`, `total_count` — consistent with
+   [`Page<T>`](#pagination), which already had `items`/`next_cursor`.
+   **Migration:** replace positional tuple destructuring with field access.
+
+   ```rust
+   // Before (0.4.0):
+   let (docs, next_cursor, total) = client
+       .list_documents::<serde_json::Value>("tenant-1", "products", Some(50), None)
+       .await?;
+   println!("{} of {total}, next={:?}", docs.len(), next_cursor);
+
+   // After (0.5.0):
+   let page = client
+       .list_documents::<serde_json::Value>("tenant-1", "products", Some(50), None)
+       .await?;
+   println!("{} of {}, next={:?}", page.items.len(), page.total_count, page.next_cursor);
+   ```
+
+   FR: **`search_documents`, `list_documents`, et `query_documents`
+   retournent desormais [`DocumentPage<T>`](#pagination) au lieu du tuple
+   anonyme `(Vec<T>, Option<String>, u64)`.** Les trois memes valeurs sont
+   desormais des champs nommes — `items`, `next_cursor`, `total_count` —
+   coherents avec [`Page<T>`](#pagination), qui avait deja `items`/
+   `next_cursor`. **Migration :** remplacez la destructuration positionnelle
+   du tuple par un acces aux champs.
+
+2. **`put_nodes` and `add_edges` now take an ordered sequence of
+   `NodeInput`/`EdgeInput` structs instead of a `HashMap`.** A
+   `HashMap` silently collapsed two items sharing the same key into one and
+   gave no ordering guarantee — a `HashMap`'s iteration order is
+   unspecified; an ordered sequence (a `Vec` in the common case) does
+   neither.
+   **Migration:** build a `Vec<NodeInput>`/`Vec<EdgeInput>` instead of a
+   `HashMap`, one entry per item — see also point 3 below for what changes
+   inside each `NodeInput`.
+
+   ```rust
+   use serde_json::json;
+
+   // Before (0.4.0):
+   use std::collections::HashMap;
+   let mut nodes = HashMap::new();
+   nodes.insert(("product".to_string(), "sku-1".to_string()), json!({"sku": "sku-1"}));
+   client.put_nodes("tenant-1", "products", nodes).await?;
+
+   // After (0.5.0):
+   use rocia_db_sdk::NodeInput;
+   let nodes = vec![NodeInput {
+       node_id: "product:sku-1".to_string(),
+       value: json!({"sku": "sku-1"}),
+       request_id: None,
+   }];
+   client.put_nodes("tenant-1", "products", nodes).await?;
+   ```
+
+   FR: **`put_nodes` et `add_edges` prennent desormais une sequence ordonnee
+   de structs `NodeInput`/`EdgeInput` au lieu d une `HashMap`.** Une
+   `HashMap` fusionnait silencieusement deux items partageant la meme cle en
+   un seul et ne garantissait aucun ordre — l ordre d iteration d une
+   `HashMap` n est pas specifie ; une sequence ordonnee (un `Vec` dans le
+   cas courant) ne fait ni l un ni l autre. **Migration :**
+   construisez un `Vec<NodeInput>`/`Vec<EdgeInput>` au lieu d une `HashMap`,
+   une entree par item — voir aussi le point 3 ci-dessous pour ce qui
+   change a l interieur de chaque `NodeInput`.
+
+3. **The easiest change to miss: `node_id` is now the complete id, and the
+   SDK no longer recomposes it from a `(label, id)` pair.** 0.4.0's
+   `HashMap<(String, String), Value>` was keyed by `(label, id)`, and
+   `put_nodes` built the wire `node_id` internally as
+   `format!("{label}:{id}")`. `NodeInput::node_id` is that
+   already-complete string — pass `"product:sku-1"` directly, not
+   `("product", "sku-1")`. **This is the migration trap to watch for**:
+   passing the bare id (`"sku-1"`) instead of the full `"product:sku-1"`
+   still compiles (both are plain `String`s) and the call still succeeds —
+   it just silently upserts the wrong node id, with nothing failing loudly
+   at compile time or runtime to catch the mistake.
+   **Migration:** grep call sites that used to build the `HashMap` key's
+   first two elements and concatenate them yourself into `node_id`, exactly
+   the way the SDK used to.
+
+   ```rust
+   // Before (0.4.0): the SDK built node_id = "product:sku-1" for you.
+   nodes.insert(("product".to_string(), "sku-1".to_string()), value);
+
+   // After (0.5.0): you build node_id yourself.
+   NodeInput { node_id: "product:sku-1".to_string(), value, request_id: None }
+   // NOT: NodeInput { node_id: "sku-1".to_string(), .. } <- compiles, wrong node.
+   ```
+
+   FR: **Le changement le plus facile a manquer : `node_id` est desormais
+   l id complet, et le SDK ne le recompose plus a partir d un couple
+   `(label, id)`.** La `HashMap<(String, String), Value>` de la 0.4.0 etait
+   indexee par `(label, id)`, et `put_nodes` construisait le `node_id` sur
+   le fil en interne via `format!("{label}:{id}")`.
+   `NodeInput::node_id` est cette chaine deja complete — passez
+   `"product:sku-1"` directement, pas `("product", "sku-1")`. **C est le
+   piege de migration a surveiller** : passer l id brut (`"sku-1"`) au lieu
+   de l id complet `"product:sku-1"` compile quand meme (les deux sont de
+   simples `String`) et l appel reussit quand meme — il upserte simplement
+   le mauvais node id en silence, sans rien qui echoue bruyamment a la
+   compilation ou a l execution pour attraper l erreur. **Migration :**
+   grep vos points d appel qui construisaient les deux premiers elements de
+   la cle `HashMap` et concatenez-les vous-meme dans `node_id`, exactement
+   comme le SDK le faisait avant.
+
+4. **`request_id` is now a field you set on every batch item, not something
+   the SDK only ever generated for you internally — a real idempotency gain
+   for retrying a partially-failed batch.** `put_nodes`/`add_edges` are
+   **not atomic**: they stop at the first error, in-flight requests are
+   cancelled, and the error does not say which items had already landed
+   (see [Batch Operations](#batch-operations)). Before 0.5.0 there was no
+   way to name each item's `request_id`, so a naive retry after a timeout
+   had no way to avoid re-issuing every item from scratch. Set
+   `request_id` explicitly and reuse the same value on retry: the server
+   deduplicates on `(tenant, operation, request_id)`, so a replay
+   recognizes and skips already-applied items, and only performs the
+   writes that never landed.
+   **Migration:** nothing is required to keep existing behavior — omitting
+   `request_id` (`None`) reproduces the pre-0.5.0 auto-generated key. Set it
+   explicitly wherever a batch might need to be replayed.
+
+   ```rust
+   use rocia_db_sdk::NodeInput;
+   use serde_json::json;
+
+   let nodes = vec![
+       NodeInput {
+           node_id: "product:sku-1".to_string(),
+           value: json!({"sku": "sku-1"}),
+           request_id: Some("batch-42:sku-1".to_string()),
+       },
+       NodeInput {
+           node_id: "product:sku-2".to_string(),
+           value: json!({"sku": "sku-2"}),
+           request_id: Some("batch-42:sku-2".to_string()),
+       },
+   ];
+
+   // First attempt times out partway through the batch.
+   if client.put_nodes("tenant-1", "products", nodes.clone()).await.is_err() {
+       // Retry with the exact same request_id values: nodes the server
+       // already applied are recognized and skipped, not reapplied — only
+       // the ones that never landed actually execute this time.
+       client.put_nodes("tenant-1", "products", nodes).await?;
+   }
+   ```
+
+   FR: **`request_id` est desormais un champ que vous fixez sur chaque item
+   du batch, pas quelque chose que le SDK generait seulement en interne —
+   un vrai gain d idempotence pour rejouer un batch partiellement echoue.**
+   `put_nodes`/`add_edges` ne sont **pas atomiques** : ils s arretent a la
+   premiere erreur, les requetes en vol sont annulees, et l erreur ne dit
+   pas quels items avaient deja atterri (voir
+   [Batch Operations](#batch-operations)). Avant la 0.5.0, il n y avait
+   aucun moyen de nommer le `request_id` de chaque item, donc un retry
+   naif apres un timeout n avait aucun moyen d eviter de reemettre chaque
+   item depuis zero. Fixez `request_id` explicitement et reutilisez la
+   meme valeur lors d un retry : le serveur deduplique sur `(tenant,
+   operation, request_id)`, donc un rejeu reconnait et ignore les items
+   deja appliques, et n execute que les ecritures qui n avaient pas
+   abouti.
+   **Migration :** rien n est requis pour conserver le comportement
+   precedent — omettre `request_id` (`None`) reproduit la cle
+   auto-generee d avant la 0.5.0. Fixez-le explicitement partout ou un
+   batch peut avoir besoin d etre rejoue.
 
 ## Migrating to 0.4.0
 

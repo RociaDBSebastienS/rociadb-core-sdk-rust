@@ -13,7 +13,9 @@
 //! FR: Rien ici n execute de requete — les fonctions ne sont jamais appelees.
 //! Elles doivent seulement compiler.
 
-use rocia_db_sdk::{DocumentQueryFilter, DocumentQueryOperator, Result, RociaDbClient};
+use rocia_db_sdk::{
+    DocumentQueryFilter, DocumentQueryOperator, EdgeInput, NodeInput, Result, RociaDbClient,
+};
 use std::sync::Arc;
 
 #[allow(dead_code)]
@@ -59,9 +61,45 @@ fn spawns_concurrent_readers(client: Arc<RociaDbClient>) {
                 operator: DocumentQueryOperator::Eq,
                 values: vec![serde_json::json!(true)],
             }];
-            let _: Result<(Vec<serde_json::Value>, Option<String>, u64)> = client
+            let _: Result<rocia_db_sdk::DocumentPage<serde_json::Value>> = client
                 .query_documents("tenant", "products", &filters, &[], Some(50), None)
                 .await;
         });
     }
+}
+
+// EN: The 0.5.0 batch helpers take `impl IntoIterator` on `&self`. That
+// combination is the one most likely to stop compiling through an `Arc`, so
+// pin it here alongside the single-item calls.
+// FR: Les helpers de batch 0.5.0 prennent un `impl IntoIterator` sur `&self`.
+// C est la combinaison la plus susceptible de cesser de compiler a travers un
+// `Arc`, on la verrouille donc ici a cote des appels unitaires.
+#[allow(dead_code)]
+async fn batches_through_an_arc(client: Arc<RociaDbClient>) -> Result<()> {
+    client
+        .put_nodes(
+            "tenant",
+            "catalog",
+            vec![NodeInput {
+                node_id: "product:sku-1".to_string(),
+                value: serde_json::json!({"sku": "sku-1"}),
+                request_id: Some("stable-node-key".to_string()),
+            }],
+        )
+        .await?;
+    client
+        .add_edges(
+            "tenant",
+            "catalog",
+            vec![EdgeInput {
+                edge_id: "membership-1".to_string(),
+                from: "product:sku-1".to_string(),
+                to: "group:featured".to_string(),
+                label: "belongs_to".to_string(),
+                value: serde_json::json!({"weight": 1}),
+                request_id: Some("stable-edge-key".to_string()),
+            }],
+        )
+        .await?;
+    Ok(())
 }
