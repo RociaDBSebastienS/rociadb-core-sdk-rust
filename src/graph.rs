@@ -11,6 +11,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 /// One page of graph neighbors returned by the upstream service.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NeighborPage {
     pub neighbors: Vec<Neighbor>,
@@ -18,6 +19,7 @@ pub struct NeighborPage {
 }
 
 /// A graph neighbor together with its decoded node payload.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct NeighborNode<T> {
     pub edge_id: String,

@@ -67,13 +67,14 @@
 //! # Stability
 //!
 //! The public API follows semantic versioning from 1.0.0 onward, with one
-//! documented exception: [`pb`] holds code generated from the `.proto` files
-//! by prost and tonic, and is not covered by that promise. A routine prost or
+//! documented exception: the internal `pb` module holds code generated from
+//! the `.proto` files by prost and tonic, and is not covered by that promise.
+//! A routine prost or
 //! tonic upgrade can reshape those generated types without this SDK's own API
 //! changing. Five of them — [`CollectionInfo`], [`StatResponse`],
 //! [`Neighbor`], [`UploadRequest`] and [`DownloadResponse`] — appear in public
 //! signatures and are re-exported at the crate root for that reason; depend on
-//! the re-exports rather than on paths reaching into [`pb`].
+//! the re-exports: the `pb` module itself is private.
 #![allow(clippy::doc_lazy_continuation)]
 
 pub mod auth;
@@ -81,20 +82,25 @@ mod document;
 mod error;
 pub mod file;
 pub mod graph;
-#[doc(hidden)]
-pub mod pb;
+pub(crate) mod pb;
 mod tenant;
 
 pub use error::{Result, RociaDbError};
 pub use file::{FileStreamUploadOptions, FileUploadOptions};
 pub use graph::{NeighborNode, NeighborPage};
 /// Generated protobuf types that appear directly in a public method signature,
-/// re-exported here so callers can name them without reaching into [`pb`].
-/// The semver caveat documented on [`pb`] applies to them: a prost or tonic
-/// upgrade can reshape these types without the SDK's own API changing.
+/// re-exported here so callers can name them without depending on the crate's
+/// private `pb` module. The stability caveat in the crate documentation applies
+/// to them: a prost or tonic upgrade can reshape these types without the SDK's
+/// own API changing.
 pub use pb::upstream::v1::{
     CollectionInfo, DownloadResponse, Neighbor, StatResponse, UploadRequest,
 };
+/// Re-exported so callers do not need `tonic` as a direct dependency just to
+/// name the return type of [`RociaDbClient::download_file_stream`]. The same
+/// stability caveat applies: a major tonic upgrade can reshape this type
+/// without the SDK's own API changing.
+pub use tonic::codec::Streaming;
 
 use crate::error::{AuthResultExt, ConnectionResultExt, JsonResultExt, StatusResultExt};
 use crate::pb::upstream::v1::document_service_client::DocumentServiceClient;
@@ -198,6 +204,7 @@ pub struct RociaDbClient {
 ///
 /// `next_cursor` is `None` once the server has no further page. The cursor
 /// is opaque and must be passed back unchanged.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -221,6 +228,7 @@ pub struct Page<T> {
 ///   every single call. Do not call this in a loop expecting a cheap
 ///   number; fetch it once and cache it if the same query is issued
 ///   repeatedly.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentPage<T> {
     pub items: Vec<T>,
@@ -271,6 +279,7 @@ fn validate_node_binding(node_label: &Option<String>, node_graph: &Option<String
 }
 
 /// Supported document query operators exposed by the SDK.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum DocumentQueryOperator {
     Eq,
@@ -289,6 +298,7 @@ impl DocumentQueryOperator {
 }
 
 /// Supported document sort directions exposed by the SDK.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum DocumentQuerySortDirection {
     Asc,

@@ -19,6 +19,7 @@ use tracing::warn;
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Response payload for OAuth2 client credentials token.
+#[non_exhaustive]
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,

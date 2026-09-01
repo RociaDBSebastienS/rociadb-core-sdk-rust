@@ -883,12 +883,14 @@ method — are the table below.
 | Lazy token invalidation, at the level of the background refresh task itself (not the `RociaDbClient`-level wrapper, which *does* translate mechanically: `invalidate_auth_token` ↔ `invalidateToken`) | `TokenManager::request_refresh` | `TokenManager.invalidate()` | Different verb chosen independently on each side for the same "mark it stale, wake the background task, do not block" idea. |
 | Standalone OAuth2 token fetch, usable outside of `TokenManager` | `auth::fetch_token` | `fetchOAuthToken` (exported from `auth.ts`, re-exported at the package root) | TypeScript needed a name that does not collide with the `fetch` Web API it wraps; Rust has no such collision. |
 | Discriminating why an `Err` happened | `RociaDbError` — a `match`-able enum: `Status { .. }` / `Connection { .. }` / `Auth { .. }` / `Encode { .. }` / `Decode { .. }` / `Validation(String)` | `RociaDbError.kind: RociaDbErrorKind`, one class with a `"status" \| "connection" \| "auth" \| "encode" \| "decode" \| "validation"` field | Different shape, not just a different name — see below. |
-| Escape hatch to the raw generated protobuf/gRPC types, to build a custom client against the same `.proto` | the `pb` module (`#[doc(hidden)] pub mod pb`; the handful of generated types that reach a public signature are re-exported individually at the crate root instead — `CollectionInfo`, `StatResponse`, `Neighbor`, `UploadRequest`, `DownloadResponse`) | the `rocia-db-sdk/proto` subpath export | Different mechanism, not just a different name: an in-crate module vs. a separate `package.json` `exports` entry. Neither is part of either package's semver contract. |
+| Escape hatch to the raw generated protobuf/gRPC types, to build a custom client against the same `.proto` | **none** — the generated module is private (`pub(crate) mod pb`). The generated types that reach a public signature are re-exported at the crate root instead: `CollectionInfo`, `StatResponse`, `Neighbor`, `UploadRequest`, `DownloadResponse`, and `Streaming` | the `rocia-db-sdk/proto` subpath export | **A real capability gap, not a naming difference.** TypeScript lets a caller reach every generated type; Rust deliberately does not, because `1.0.0` puts the crate's public surface under semantic versioning and generated code is reshaped by any prost or tonic upgrade. Reopen this if a Rust consumer needs it — it would be an addition, not a removal. |
 
 **The error-kind trap, spelled out:** both sides recognize the exact
 same six causes, in the same order, but represent the choice differently.
-Rust's `RociaDbError` is a real sum type — matching on it is exhaustive,
-and the compiler flags a missing arm. TypeScript keeps a single
+Rust's `RociaDbError` is a real sum type, marked `#[non_exhaustive]` so a
+later release can recognize a new cause without breaking existing callers:
+a match must carry a wildcard arm, and the compiler flags a missing one
+among the causes it does name. TypeScript keeps a single
 `RociaDbError` class (so an existing `instanceof RociaDbError` check never
 breaks) and puts the same six-way choice in a `kind` field instead —
 narrowing on `error.kind` gets you the same exhaustiveness check from

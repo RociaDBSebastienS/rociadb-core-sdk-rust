@@ -1,13 +1,11 @@
 //! Generated protobuf types and gRPC clients.
 //!
-//! This module is **not** part of the SDK's semver contract: it is
-//! regenerated from `proto/upstream/v1/upstream.proto` by prost/tonic, and
-//! a routine prost or tonic upgrade can change field types, add fields, or
+//! This module is internal to the crate. It is regenerated from
+//! `proto/upstream/v1/upstream.proto` by prost/tonic on every build, and a
+//! routine prost or tonic upgrade can change field types, add fields, or
 //! otherwise reshape these generated types without the SDK's own API
-//! changing at all. It stays `pub` (rather than `pub(crate)`) only because
-//! the crate's own submodules need `crate::pb::...` paths across module
-//! boundaries; `#[doc(hidden)]` keeps it out of the published docs and out
-//! of the surface callers should treat as stable.
+//! changing at all — which is why nothing outside the crate can name a type
+//! here, and why the module is not part of the semver contract.
 //!
 //! The handful of generated types that genuinely are part of the public
 //! contract — because they appear in a public method signature and callers

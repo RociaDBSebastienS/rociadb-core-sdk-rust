@@ -22,6 +22,9 @@ pub type Result<T> = std::result::Result<T, RociaDbError>;
 /// `PERMISSION_DENIED` is final — the token is valid but lacks the required
 /// scope, and retrying after a refresh will not help (see
 /// [`RociaDbError::is_permission_denied`]).
+/// New variants may be added in a minor release: match on this enum with a
+/// wildcard arm to stay forward-compatible.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum RociaDbError {
     /// A gRPC call to the upstream server returned a non-OK status.
