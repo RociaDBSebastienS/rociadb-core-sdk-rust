@@ -1184,7 +1184,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rocia-db-sdk"
+name = "rociadb-sdk"
 version = "1.0.0"
 dependencies = [
  "futures",

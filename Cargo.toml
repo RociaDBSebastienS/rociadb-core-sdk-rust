@@ -1,12 +1,12 @@
 [package]
-name = "rocia-db-sdk"
+name = "rociadb-sdk"
 version = "1.0.0"
 edition = "2024"
 description = "Rust client SDK for RociaDB document, graph, file, and tenant gRPC services"
 license = "Apache-2.0"
 repository = "https://github.com/RociaDB/rociadb-core-sdk-rust"
 homepage = "https://github.com/RociaDB/rociadb-core-sdk-rust"
-documentation = "https://docs.rs/rocia-db-sdk"
+documentation = "https://docs.rs/rociadb-sdk"
 readme = "README.md"
 keywords = ["rociadb", "database", "grpc", "sdk", "async"]
 categories = ["api-bindings", "database", "network-programming", "asynchronous"]

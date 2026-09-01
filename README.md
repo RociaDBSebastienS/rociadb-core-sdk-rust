@@ -1,4 +1,4 @@
-# rocia-db-sdk
+# rociadb-sdk
 
 Rust client SDK for the Rocia DB gRPC upstream services: documents, graph,
 files, and tenants.
@@ -41,7 +41,7 @@ messages.
 
 ```toml
 [dependencies]
-rocia-db-sdk = "1.0"
+rociadb-sdk = "1.0"
 ```
 
 Building the crate runs a build script that compiles the bundled
@@ -54,15 +54,15 @@ variable. No other system dependency is required: the Google well-known
 types the API uses are vendored under `proto/google/protobuf/`.
 
 This is a standalone crate, not a workspace member: there is no
-`crates/rocia-db-sdk` path inside it. To work against an unreleased change,
+`crates/rociadb-sdk` path inside it. To work against an unreleased change,
 depend on a checkout or on git instead of the published version:
 
 ```toml
 [dependencies]
 # From a sibling checkout:
-rocia-db-sdk = { path = "../rocia-db-sdk-rust" }
+rociadb-sdk = { path = "../rocia-db-sdk-rust" }
 # Or pinned to a tag from git:
-# rocia-db-sdk = { git = "https://github.com/RociaDB/rociadb-core-sdk-rust", tag = "v1.0.0" }
+# rociadb-sdk = { git = "https://github.com/RociaDB/rociadb-core-sdk-rust", tag = "v1.0.0" }
 ```
 
 `Cargo.toml` declares `rust-version = "1.88"` — the minimum toolchain this
@@ -76,11 +76,11 @@ For a runnable project that wires the SDK up end to end, see
 ## Quick Start
 
 ```rust
-use rocia_db_sdk::RociaDbBuilder;
+use rociadb_sdk::RociaDbBuilder;
 use serde_json::json;
 
 # #[tokio::main]
-# async fn main() -> rocia_db_sdk::Result<()> {
+# async fn main() -> rociadb_sdk::Result<()> {
 let client = RociaDbBuilder::new()
     .host("http://127.0.0.1:50051")
     .auth_client_credentials(
@@ -227,7 +227,7 @@ callers who need auth outside of `RociaDbClient` (for example, to reuse the
 same token against a different service).
 
 ```rust
-use rocia_db_sdk::auth::TokenManager;
+use rociadb_sdk::auth::TokenManager;
 
 let http = reqwest::Client::new();
 let token_manager = TokenManager::new(
@@ -273,7 +273,7 @@ always applies some connect timeout, so a slow or unreachable DNS/TCP
 target fails after a bounded wait instead of hanging `.await` forever.
 
 ```rust
-use rocia_db_sdk::RociaDbBuilder;
+use rociadb_sdk::RociaDbBuilder;
 use std::time::Duration;
 
 let client = RociaDbBuilder::new()
@@ -330,7 +330,7 @@ the full candidate set on `query_documents` — never call `query_documents`
 in a loop just to get a count.
 
 ```rust
-use rocia_db_sdk::{DocumentQueryFilter, DocumentQueryOperator, DocumentQuerySort, DocumentQuerySortDirection};
+use rociadb_sdk::{DocumentQueryFilter, DocumentQueryOperator, DocumentQuerySort, DocumentQuerySortDirection};
 use serde_json::json;
 
 // list_documents: every document in a collection.
@@ -388,7 +388,7 @@ structs — anything `IntoIterator<Item = NodeInput>` /
 the same id are never silently merged into one, both are sent.
 
 ```rust
-use rocia_db_sdk::{EdgeInput, NodeInput};
+use rociadb_sdk::{EdgeInput, NodeInput};
 use serde_json::json;
 
 let nodes = vec![
@@ -524,7 +524,7 @@ never touch `upload_file_chunked` or `upload_file_stream` directly.
   eventually reclaims; the partial file never appears anywhere.
 
 ```rust
-use rocia_db_sdk::file::FileUploadOptions;
+use rociadb_sdk::file::FileUploadOptions;
 
 // options.checksum: None -> upload_file computes SHA-256 of the buffer for
 // you and chunks it into exactly-1-MiB messages. You do not need to touch
@@ -567,7 +567,7 @@ start from. If `chunks` ends up producing more or fewer total bytes than
 reject anyway at the end.
 
 ```rust
-use rocia_db_sdk::file::FileStreamUploadOptions;
+use rociadb_sdk::file::FileStreamUploadOptions;
 use futures::stream;
 use sha2::{Digest, Sha256};
 
@@ -736,7 +736,7 @@ Two token scopes matter for this SDK:
 
 ## Error Handling
 
-Public methods return `rocia_db_sdk::Result<T>`, an alias for
+Public methods return `rociadb_sdk::Result<T>`, an alias for
 `std::result::Result<T, RociaDbError>`. `RociaDbError` is a typed enum,
 not a boxed `dyn Error`, so callers can `match` on the failure kind
 directly instead of downcasting:
@@ -863,6 +863,12 @@ translate mechanically (`put_nodes` ↔ `putNodes`,
 handful of places where a name or shape does **not** translate
 mechanically — where translating a call by ear lands you on the wrong
 method — are the table below.
+
+The two are packaged and versioned independently: this crate is
+`rociadb-sdk` on crates.io, the TypeScript package is `rocia-db-sdk` on
+npm, and their version numbers advance separately. Neither the differing
+package name nor a gap in major version is a signal of a capability
+difference — the table below is the source of truth for parity.
 
 | Capability | Rust ([`rociadb-core-sdk-rust`](https://github.com/RociaDB/rociadb-core-sdk-rust)) | TypeScript ([`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts)) | Note |
 |---|---|---|---|

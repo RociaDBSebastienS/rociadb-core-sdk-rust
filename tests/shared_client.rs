@@ -6,7 +6,7 @@
 //! Nothing here runs a request — the functions are never called. They only
 //! have to compile.
 
-use rocia_db_sdk::{
+use rociadb_sdk::{
     DocumentQueryFilter, DocumentQueryOperator, EdgeInput, NodeInput, Result, RociaDbClient,
 };
 use std::sync::Arc;
@@ -52,7 +52,7 @@ fn spawns_concurrent_readers(client: Arc<RociaDbClient>) {
                 DocumentQueryOperator::Eq,
                 vec![serde_json::json!(true)],
             )];
-            let _: Result<rocia_db_sdk::DocumentPage<serde_json::Value>> = client
+            let _: Result<rociadb_sdk::DocumentPage<serde_json::Value>> = client
                 .query_documents("tenant", "products", &filters, &[], Some(50), None)
                 .await;
         });

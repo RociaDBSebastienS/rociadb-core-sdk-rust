@@ -8,11 +8,11 @@
 //! # Quick example
 //!
 //! ```rust,no_run
-//! use rocia_db_sdk::RociaDbBuilder;
+//! use rociadb_sdk::RociaDbBuilder;
 //! use serde_json::json;
 //!
 //! # #[tokio::main]
-//! # async fn main() -> rocia_db_sdk::Result<()> {
+//! # async fn main() -> rociadb_sdk::Result<()> {
 //! let client = RociaDbBuilder::new()
 //!     .host("http://127.0.0.1:50051")
 //!     .auth_client_credentials(
