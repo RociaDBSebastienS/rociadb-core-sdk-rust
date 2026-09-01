@@ -1,6 +1,12 @@
 //! Rocia DB SDK client for gRPC upstream services.
 //!
-//! Quick example:
+//! The client speaks to a RociaDB server over gRPC and covers four service
+//! areas: documents, graph nodes and edges, file transfer, and tenants.
+//! Every call goes through a single [`RociaDbClient`], built by
+//! [`RociaDbBuilder`], which owns the connection and the auth token refresh.
+//!
+//! # Quick example
+//!
 //! ```rust,no_run
 //! use rocia_db_sdk::RociaDbBuilder;
 //! use serde_json::json;
@@ -30,6 +36,44 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Building
+//!
+//! The build script compiles the `.proto` files bundled with this crate, so
+//! **`protoc` must be available** on any machine that compiles it, including
+//! CI: either on `PATH`, or at the location given by the `PROTOC` environment
+//! variable. Nothing else is needed from the system — the Google well-known
+//! types the API uses ship inside the crate.
+//!
+//! # Example project
+//!
+//! [`example-rust-project`](https://github.com/RociaDB/example-rust-project)
+//! wires this SDK into a runnable program, end to end.
+//!
+//! # Where things live
+//!
+//! Document, graph, file and tenant calls are all inherent methods on
+//! [`RociaDbClient`], so the module list is short:
+//!
+//! - [`auth`] — token acquisition and refresh, and the interceptors that
+//!   attach credentials to outgoing calls. Useful when you drive
+//!   authentication yourself rather than through the builder.
+//! - [`mod@file`] — the option types for uploads ([`FileUploadOptions`],
+//!   [`FileStreamUploadOptions`]) and the chunking rules the wire contract
+//!   imposes.
+//! - [`graph`] — the page and node types returned by neighbor traversal
+//!   ([`NeighborPage`], [`NeighborNode`]).
+//!
+//! # Stability
+//!
+//! The public API follows semantic versioning from 1.0.0 onward, with one
+//! documented exception: [`pb`] holds code generated from the `.proto` files
+//! by prost and tonic, and is not covered by that promise. A routine prost or
+//! tonic upgrade can reshape those generated types without this SDK's own API
+//! changing. Five of them — [`CollectionInfo`], [`StatResponse`],
+//! [`Neighbor`], [`UploadRequest`] and [`DownloadResponse`] — appear in public
+//! signatures and are re-exported at the crate root for that reason; depend on
+//! the re-exports rather than on paths reaching into [`pb`].
 #![allow(clippy::doc_lazy_continuation)]
 
 pub mod auth;

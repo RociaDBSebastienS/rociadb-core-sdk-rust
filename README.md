@@ -41,7 +41,7 @@ messages.
 
 ```toml
 [dependencies]
-rocia-db-sdk = "0.6"
+rocia-db-sdk = "1.0"
 ```
 
 Building the crate runs a build script that compiles the bundled
@@ -62,7 +62,7 @@ depend on a checkout or on git instead of the published version:
 # From a sibling checkout:
 rocia-db-sdk = { path = "../rocia-db-sdk-rust" }
 # Or pinned to a tag from git:
-# rocia-db-sdk = { git = "https://github.com/RociaDB/rociadb-core-sdk-rust", tag = "v0.6.0" }
+# rocia-db-sdk = { git = "https://github.com/RociaDB/rociadb-core-sdk-rust", tag = "v1.0.0" }
 ```
 
 `Cargo.toml` declares `rust-version = "1.88"` — the minimum toolchain this

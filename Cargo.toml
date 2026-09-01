@@ -1,6 +1,6 @@
 [package]
 name = "rocia-db-sdk"
-version = "0.6.0"
+version = "1.0.0"
 edition = "2024"
 description = "Rust client SDK for RociaDB document, graph, file, and tenant gRPC services"
 license = "Apache-2.0"
