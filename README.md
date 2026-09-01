@@ -4,7 +4,7 @@ Rust client SDK for the Rocia DB gRPC upstream services: documents, graph,
 files, and tenants.
 
 The Node.js/TypeScript SDK lives in its own sibling repository
-([`rociadb-core-sdk-ts`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-ts)),
+([`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts)),
 not in this checkout — there is no `typescript/` directory here.
 
 ## Table of Contents
@@ -39,21 +39,39 @@ messages.
 
 ## Installation
 
+```toml
+[dependencies]
+rocia-db-sdk = "0.6"
+```
+
+Building the crate runs a build script that compiles the bundled
+`.proto` files, so **`protoc` must be available** on any machine that
+compiles it — including CI. Install it from your package manager
+(`apt install protobuf-compiler`, `brew install protobuf`) or from the
+[protobuf releases](https://github.com/protocolbuffers/protobuf/releases),
+and make sure it is on `PATH` or pointed at by the `PROTOC` environment
+variable. No other system dependency is required: the Google well-known
+types the API uses are vendored under `proto/google/protobuf/`.
+
 This is a standalone crate, not a workspace member: there is no
-`crates/rocia-db-sdk` path inside it. Depend on it as a path dependency from
-a sibling checkout, or as a git dependency:
+`crates/rocia-db-sdk` path inside it. To work against an unreleased change,
+depend on a checkout or on git instead of the published version:
 
 ```toml
 [dependencies]
 # From a sibling checkout:
 rocia-db-sdk = { path = "../rocia-db-sdk-rust" }
 # Or pinned to a tag from git:
-# rocia-db-sdk = { git = "https://github.com/RociaDBSebastienS/rociadb-core-sdk-rust", tag = "v0.6.0" }
+# rocia-db-sdk = { git = "https://github.com/RociaDB/rociadb-core-sdk-rust", tag = "v0.6.0" }
 ```
 
-`Cargo.toml` declares `rust-version = "1.85"` (the first stable release
-supporting `edition = "2024"`) — the minimum toolchain this crate is built
-and tested against.
+`Cargo.toml` declares `rust-version = "1.88"` — the minimum toolchain this
+crate is built and tested against. The floor is set by the dependency graph,
+not by `edition = "2024"`; the comment above that field records which
+dependencies pin it.
+
+For a runnable project that wires the SDK up end to end, see
+[`example-rust-project`](https://github.com/RociaDB/example-rust-project).
 
 ## Quick Start
 
@@ -839,7 +857,7 @@ those re-exports, not on paths reaching into `pb` directly.
 ## Parity with the TypeScript SDK
 
 This SDK and the TypeScript SDK
-([`rociadb-core-sdk-ts`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-ts))
+([`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts))
 cover the same 22 RPCs against the same server, and are maintained to the
 same standard: **every capability available in one is available in the
 other.** Neither imitates the other's syntax — this crate stays
@@ -856,7 +874,7 @@ handful of places where a name or shape does **not** translate
 mechanically — where translating a call by ear lands you on the wrong
 method — are the table below.
 
-| Capability | Rust ([`rociadb-core-sdk-rust`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-rust)) | TypeScript ([`rociadb-core-sdk-ts`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-ts)) | Note |
+| Capability | Rust ([`rociadb-core-sdk-rust`](https://github.com/RociaDB/rociadb-core-sdk-rust)) | TypeScript ([`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts)) | Note |
 |---|---|---|---|
 | Assisted streaming upload — re-chunks to the 1 MiB wire contract, validates the total, caller supplies the checksum | `upload_file_chunked` | `uploadFileStream` | Names do **not** correspond — see below. |
 | Raw streaming upload — zero validation, caller builds every protobuf message | `upload_file_stream` | `uploadFileRaw` | Names do **not** correspond — the mirror image of the row above. |
@@ -925,6 +943,10 @@ PROTOC=/usr/bin/protoc cargo test
 Add focused unit tests in `#[cfg(test)] mod tests` next to the code they
 cover, and public API scenarios under `tests/`; keep tests deterministic
 and independent of a live RociaDB or OAuth2 service. Run formatting,
-Clippy, and tests before submitting changes — see `AGENTS.md` for the full
+Clippy, and tests before submitting changes — see
+[`AGENTS.md`](https://github.com/RociaDB/rociadb-core-sdk-rust/blob/main/AGENTS.md)
+for the full
 contribution guidelines, including commit and pull-request conventions and
 the canonical location for `.proto` changes.
+
+Licensed under Apache-2.0.

@@ -1191,7 +1191,6 @@ dependencies = [
  "http",
  "pbjson-types",
  "prost",
- "prost-build",
  "reqwest",
  "serde",
  "serde_json",

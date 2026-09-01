@@ -44,6 +44,10 @@ mod tenant;
 pub use error::{Result, RociaDbError};
 pub use file::{FileStreamUploadOptions, FileUploadOptions};
 pub use graph::{NeighborNode, NeighborPage};
+/// Generated protobuf types that appear directly in a public method signature,
+/// re-exported here so callers can name them without reaching into [`pb`].
+/// The semver caveat documented on [`pb`] applies to them: a prost or tonic
+/// upgrade can reshape these types without the SDK's own API changing.
 pub use pb::upstream::v1::{
     CollectionInfo, DownloadResponse, Neighbor, StatResponse, UploadRequest,
 };
@@ -1129,6 +1133,14 @@ impl RociaDbClient {
         })
     }
 
+    /// Fetch a single document by id and decode its JSON payload into `T`
+    /// (`GetDoc`).
+    ///
+    /// Unlike [`search_documents`](Self::search_documents),
+    /// [`list_documents`](Self::list_documents) and
+    /// [`query_documents`](Self::query_documents), this returns the value
+    /// directly rather than a [`DocumentPage`]: there is nothing to paginate
+    /// when fetching by id.
     pub async fn get_document<T>(
         &self,
         tenant_id: &str,

@@ -1,3 +1,5 @@
+//! Graph node and edge operations: single-item reads and writes, batch
+//! upserts with bounded concurrency, and paginated neighbor traversal.
 use crate::error::{JsonResultExt, StatusResultExt};
 use crate::pb::upstream::v1::{
     AddEdgeRequest, DeleteEdgeRequest, GetNodeRequest, ListGraphsRequest, ListNodesRequest,

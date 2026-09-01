@@ -2,10 +2,25 @@
 name = "rocia-db-sdk"
 version = "0.6.0"
 edition = "2024"
-description = "RociaDB-SDK"
+description = "Rust client SDK for RociaDB document, graph, file, and tenant gRPC services"
 license = "Apache-2.0"
-# 1.85 is the first stable release supporting `edition = "2024"`.
-rust-version = "1.85"
+repository = "https://github.com/RociaDB/rociadb-core-sdk-rust"
+homepage = "https://github.com/RociaDB/rociadb-core-sdk-rust"
+documentation = "https://docs.rs/rocia-db-sdk"
+readme = "README.md"
+keywords = ["rociadb", "database", "grpc", "sdk", "async"]
+categories = ["api-bindings", "database", "network-programming", "asynchronous"]
+# `edition = "2024"` needs 1.85, but the real floor comes from the dependency
+# graph rather than the edition: tonic and tonic-prost 0.14.6 — which the
+# "0.14.2" requirement below already resolves to — declare `rust-version =
+# "1.88"`, and the icu_* crates reached through reqwest -> url -> idna declare
+# 1.86. Re-check this field after any `cargo update` that moves tonic,
+# tonic-prost, or reqwest.
+rust-version = "1.88"
+# Repository-only files that a consumer of the published crate has no use for.
+# Everything the build needs — `build.rs`, `proto/` and the vendored
+# `proto/google/protobuf/*.proto` — must stay in the package.
+exclude = ["AGENTS.md", "mise.toml"]
 
 [dependencies]
 futures = "0.3.31"
@@ -23,7 +38,8 @@ tonic-prost = "0.14.2"
 tracing = "0.1"
 uuid = { version = "1.19.0", features = ["v4"] }
 
+# `build.rs` only calls `tonic_prost_build::configure()`. The prost and tonic
+# runtime crates the generated code links against are regular dependencies
+# above, not build dependencies.
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }
-prost-build = "0.14"
-tonic-prost = "0.14.2"
