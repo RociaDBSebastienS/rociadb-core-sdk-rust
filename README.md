@@ -344,15 +344,12 @@ let matches = client
     .await?;
 
 // query_documents: multiple filters, combined with AND, plus sorting.
-let filters = [DocumentQueryFilter {
-    field: "status".to_string(),
-    operator: DocumentQueryOperator::Eq,
-    values: vec![json!("active")],
-}];
-let sort = [DocumentQuerySort {
-    field: "label".to_string(),
-    direction: DocumentQuerySortDirection::Asc,
-}];
+let filters = [DocumentQueryFilter::new(
+    "status",
+    DocumentQueryOperator::Eq,
+    vec![json!("active")],
+)];
+let sort = [DocumentQuerySort::new("label", DocumentQuerySortDirection::Asc)];
 let results = client
     .query_documents::<serde_json::Value>("tenant-1", "products", &filters, &sort, Some(50), None)
     .await?;
@@ -395,27 +392,20 @@ use rocia_db_sdk::{EdgeInput, NodeInput};
 use serde_json::json;
 
 let nodes = vec![
-    NodeInput {
-        node_id: "product:sku-1".to_string(),
-        value: json!({"sku": "sku-1"}),
-        request_id: None,
-    },
-    NodeInput {
-        node_id: "product:sku-2".to_string(),
-        value: json!({"sku": "sku-2"}),
-        request_id: None,
-    },
+    NodeInput::new("product:sku-1", json!({"sku": "sku-1"})),
+    // Supply your own idempotency key when a retry must not write twice:
+    NodeInput::new("product:sku-2", json!({"sku": "sku-2"}))
+        .with_request_id("put_node:import-42"),
 ];
 client.put_nodes("tenant-1", "products", nodes).await?;
 
-let edges = vec![EdgeInput {
-    edge_id: "1".to_string(),
-    from: "product:sku-1".to_string(),
-    to: "group:grp-1".to_string(),
-    label: "belongs_to".to_string(),
-    value: json!({"weight": 1}),
-    request_id: None,
-}];
+let edges = vec![EdgeInput::new(
+    "1",
+    "product:sku-1",
+    "group:grp-1",
+    "belongs_to",
+    json!({"weight": 1}),
+)];
 client.add_edges("tenant-1", "products", edges).await?;
 ```
 
@@ -919,14 +909,12 @@ already exists and gives the identical guarantee: drop the last clone.
 connection underneath, so this is not a weaker substitute — it is the same
 guarantee, spelled the Rust way (RAII instead of an explicit call).
 
-Two capabilities are intentionally kept on one side without a mirror on
-the other: `ApiKeyInterceptor` (Rust only — it validates an *incoming* API
-key, so it serves building a server or a test double, not talking to
-RociaDB, which puts it out of scope for a client SDK), and having both
-`RociaDbBuilder::build()` and a direct `RociaDbClient.connect()` entry
-point (TypeScript only — the builder there is a thin wrapper with no
-capability of its own, so duplicating a second entry point in Rust would
-add an API to maintain for zero new capability).
+One capability is intentionally kept on one side without a mirror on the
+other: having both `RociaDbBuilder::build()` and a direct
+`RociaDbClient.connect()` entry point (TypeScript only — the builder there
+is a thin wrapper with no capability of its own, so duplicating a second
+entry point in Rust would add an API to maintain for zero new
+capability).
 
 ## Development
 

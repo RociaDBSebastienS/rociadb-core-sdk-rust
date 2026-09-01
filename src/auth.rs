@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
-use tonic::metadata::{Ascii, MetadataKey, MetadataValue};
+use tonic::metadata::{Ascii, MetadataValue};
 use tonic::{Request, Status, service::Interceptor};
 use tracing::warn;
 
@@ -253,149 +253,15 @@ impl Interceptor for BearerInterceptor {
     }
 }
 
-/// Interceptor that validates an incoming API key.
-#[derive(Clone)]
-pub struct ApiKeyInterceptor {
-    expected_key: String,
-    header: MetadataKey<Ascii>,
-}
-
-impl ApiKeyInterceptor {
-    /// Create an API key interceptor using the expected key.
-    pub fn new(expected_key: String) -> Self {
-        Self {
-            expected_key,
-            header: MetadataKey::from_static("x-api-key"),
-        }
-    }
-}
-
-impl Interceptor for ApiKeyInterceptor {
-    fn call(&mut self, request: Request<()>) -> std::result::Result<Request<()>, Status> {
-        match request
-            .metadata()
-            .get(&self.header)
-            .and_then(|value| value.to_str().ok())
-        {
-            Some(provided)
-                if constant_time_eq(provided.as_bytes(), self.expected_key.as_bytes()) =>
-            {
-                Ok(request)
-            }
-            Some(_) => {
-                warn!("invalid API key received");
-                Err(Status::unauthenticated("invalid API key"))
-            }
-            None => {
-                warn!("missing API key");
-                Err(Status::unauthenticated("missing API key"))
-            }
-        }
-    }
-}
-
-/// Constant-time byte comparison: always inspects every byte of the longer
-/// input before returning, instead of short-circuiting on the first
-/// mismatch (what `==` does on `&str`/`&[u8]`). Used by
-/// [`ApiKeyInterceptor::call`] so the time a comparison takes cannot leak,
-/// byte by byte, how much of the provided key matched the expected one.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() != b.len()) as u8;
-    for i in 0..a.len().max(b.len()) {
-        let byte_a = a.get(i).copied().unwrap_or(0);
-        let byte_b = b.get(i).copied().unwrap_or(0);
-        diff |= byte_a ^ byte_b;
-    }
-    diff == 0
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ApiKeyInterceptor, TokenManager, TokenManagerInner, TokenResponse, build_header,
-        constant_time_eq,
-    };
+    use super::{TokenManager, TokenManagerInner, TokenResponse, build_header};
     use std::sync::Arc;
     use std::sync::RwLock;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
     use tokio::sync::Notify;
-    use tonic::Request;
     use tonic::metadata::{Ascii, MetadataValue};
-    use tonic::service::Interceptor;
-
-    // These tests lock in that `constant_time_eq` is a *correct* equality
-    // check. The always-scan-every-byte property that gives it its
-    // timing-safety guarantee is enforced by the implementation itself and
-    // is not observable through a deterministic unit test.
-
-    #[test]
-    fn constant_time_eq_accepts_identical_byte_strings() {
-        assert!(constant_time_eq(b"super-secret-key", b"super-secret-key"));
-    }
-
-    #[test]
-    fn constant_time_eq_accepts_two_empty_slices() {
-        assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn constant_time_eq_rejects_a_single_differing_byte_at_any_position() {
-        let expected = b"abcdefgh";
-        for i in 0..expected.len() {
-            let mut candidate = expected.to_vec();
-            candidate[i] ^= 0xFF;
-            assert!(
-                !constant_time_eq(&candidate, expected),
-                "byte {i} differs from expected but was accepted as equal"
-            );
-        }
-    }
-
-    #[test]
-    fn constant_time_eq_rejects_different_lengths_even_when_one_is_a_prefix_of_the_other() {
-        assert!(!constant_time_eq(b"short", b"short-but-longer"));
-        assert!(!constant_time_eq(b"short-but-longer", b"short"));
-    }
-
-    fn request_with_api_key(key: Option<&str>) -> Request<()> {
-        let mut request = Request::new(());
-        if let Some(key) = key {
-            request.metadata_mut().insert(
-                "x-api-key",
-                key.parse::<MetadataValue<Ascii>>()
-                    .expect("test key must be a valid ascii metadata value"),
-            );
-        }
-        request
-    }
-
-    #[test]
-    fn api_key_interceptor_accepts_the_matching_key() {
-        let mut interceptor = ApiKeyInterceptor::new("expected-key".to_string());
-        let request = request_with_api_key(Some("expected-key"));
-        assert!(interceptor.call(request).is_ok());
-    }
-
-    #[test]
-    fn api_key_interceptor_rejects_a_mismatched_key() {
-        let mut interceptor = ApiKeyInterceptor::new("expected-key".to_string());
-        let request = request_with_api_key(Some("wrong-key"));
-        let status = interceptor
-            .call(request)
-            .expect_err("a mismatched key must be rejected");
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[test]
-    fn api_key_interceptor_rejects_a_missing_key() {
-        let mut interceptor = ApiKeyInterceptor::new("expected-key".to_string());
-        let request = request_with_api_key(None);
-        let status = interceptor
-            .call(request)
-            .expect_err("a missing key must be rejected");
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-    }
 
     /// Builds a `TokenManager` directly from `TokenManagerInner` (rather
     /// than via `TokenManager::new`, which performs a real HTTP round trip)

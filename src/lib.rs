@@ -315,6 +315,7 @@ impl DocumentQuerySortDirection {
 }
 
 /// Filter definition for `QueryDoc`.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DocumentQueryFilter {
     pub field: String,
@@ -322,11 +323,39 @@ pub struct DocumentQueryFilter {
     pub values: Vec<Value>,
 }
 
+impl DocumentQueryFilter {
+    /// Build a filter on `field`, comparing it against `values` with
+    /// `operator`. How many values an operator expects is the server's
+    /// contract, not the SDK's: `Eq` takes one, `In` takes the set to match.
+    pub fn new(
+        field: impl Into<String>,
+        operator: DocumentQueryOperator,
+        values: Vec<Value>,
+    ) -> Self {
+        Self {
+            field: field.into(),
+            operator,
+            values,
+        }
+    }
+}
+
 /// Sort definition for `QueryDoc`.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DocumentQuerySort {
     pub field: String,
     pub direction: DocumentQuerySortDirection,
+}
+
+impl DocumentQuerySort {
+    /// Sort on `field` in `direction`.
+    pub fn new(field: impl Into<String>, direction: DocumentQuerySortDirection) -> Self {
+        Self {
+            field: field.into(),
+            direction,
+        }
+    }
 }
 
 /// One node to upsert, used by [`RociaDbClient::put_nodes`].
@@ -335,6 +364,7 @@ pub struct DocumentQuerySort {
 /// not a `(label, id)` pair for the SDK to reassemble: `label:id` remains a
 /// usage convention, not something the server enforces or the SDK
 /// recomposes.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeInput {
     pub node_id: String,
@@ -351,9 +381,29 @@ pub struct NodeInput {
     pub request_id: Option<String>,
 }
 
+impl NodeInput {
+    /// Upsert `value` at `node_id`, letting the SDK generate the
+    /// idempotency key. Chain [`NodeInput::with_request_id`] to supply your
+    /// own — which is what makes a retried batch safe to replay.
+    pub fn new(node_id: impl Into<String>, value: Value) -> Self {
+        Self {
+            node_id: node_id.into(),
+            value,
+            request_id: None,
+        }
+    }
+
+    /// Set the idempotency key for this item; see [`NodeInput::request_id`].
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+}
+
 /// One edge to upsert, used by [`RociaDbClient::add_edges`].
 ///
 /// `edge_id` is raw and must not be prefixed with `label`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeInput {
     pub edge_id: String,
@@ -365,6 +415,35 @@ pub struct EdgeInput {
     /// generated automatically (a bare UUID, with no prefix). See
     /// [`NodeInput::request_id`] for why reusing it on a retry matters.
     pub request_id: Option<String>,
+}
+
+impl EdgeInput {
+    /// Upsert an edge `label` carrying `value`, running `from` -> `to`,
+    /// letting the SDK generate the idempotency key. Chain
+    /// [`EdgeInput::with_request_id`] to supply your own. `edge_id` is raw:
+    /// do not prefix it with `label`.
+    pub fn new(
+        edge_id: impl Into<String>,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        label: impl Into<String>,
+        value: Value,
+    ) -> Self {
+        Self {
+            edge_id: edge_id.into(),
+            from: from.into(),
+            to: to.into(),
+            label: label.into(),
+            value,
+            request_id: None,
+        }
+    }
+
+    /// Set the idempotency key for this item; see [`EdgeInput::request_id`].
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
 }
 
 /// Build the ordered `PutNodeRequest` batch for [`RociaDbClient::put_nodes`].

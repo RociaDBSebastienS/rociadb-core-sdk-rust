@@ -47,11 +47,11 @@ fn spawns_concurrent_readers(client: Arc<RociaDbClient>) {
     for _ in 0..4 {
         let client = Arc::clone(&client);
         tokio::spawn(async move {
-            let filters = [DocumentQueryFilter {
-                field: "active".to_string(),
-                operator: DocumentQueryOperator::Eq,
-                values: vec![serde_json::json!(true)],
-            }];
+            let filters = [DocumentQueryFilter::new(
+                "active",
+                DocumentQueryOperator::Eq,
+                vec![serde_json::json!(true)],
+            )];
             let _: Result<rocia_db_sdk::DocumentPage<serde_json::Value>> = client
                 .query_documents("tenant", "products", &filters, &[], Some(50), None)
                 .await;
@@ -68,25 +68,26 @@ async fn batches_through_an_arc(client: Arc<RociaDbClient>) -> Result<()> {
         .put_nodes(
             "tenant",
             "catalog",
-            vec![NodeInput {
-                node_id: "product:sku-1".to_string(),
-                value: serde_json::json!({"sku": "sku-1"}),
-                request_id: Some("stable-node-key".to_string()),
-            }],
+            vec![
+                NodeInput::new("product:sku-1", serde_json::json!({"sku": "sku-1"}))
+                    .with_request_id("stable-node-key"),
+            ],
         )
         .await?;
     client
         .add_edges(
             "tenant",
             "catalog",
-            vec![EdgeInput {
-                edge_id: "membership-1".to_string(),
-                from: "product:sku-1".to_string(),
-                to: "group:featured".to_string(),
-                label: "belongs_to".to_string(),
-                value: serde_json::json!({"weight": 1}),
-                request_id: Some("stable-edge-key".to_string()),
-            }],
+            vec![
+                EdgeInput::new(
+                    "membership-1",
+                    "product:sku-1",
+                    "group:featured",
+                    "belongs_to",
+                    serde_json::json!({"weight": 1}),
+                )
+                .with_request_id("stable-edge-key"),
+            ],
         )
         .await?;
     Ok(())
